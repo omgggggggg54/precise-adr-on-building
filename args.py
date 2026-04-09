@@ -45,19 +45,18 @@ def register_args(parser, config_file="config/all_HGT_config.yaml"):
     # parser.add_argument("--split", type=str, default="by_label")
     parser.add_argument("--n_data", type=int, default=0)
     parser.add_argument("--se_min_count", type=int, default=100)
-
-    parser.add_argument("--log_dir", type=str, default='./log/', )
     parser.add_argument("--config", type=str, default=config_file)
 
 
 def parse_args_and_yaml(given_parser):
+    '''先按默认设置args,然后yaml文件覆盖,最后是命令行输入覆盖'''
 
-    given_configs, remaining = given_parser.parse_known_args()
+    given_configs, remaining = given_parser.parse_known_args()#只获取args已经设置的参数项
     if given_configs.config:
         if os.path.exists(given_configs.config):
             with open(given_configs.config, 'r', encoding='utf-8') as f:
                 cfg = yaml.safe_load(f)
-                given_parser.set_defaults(**cfg)
+                given_parser.set_defaults(**cfg)#set_defaults 不检查参数是否提前定义过，会直接添加属性。
         else:
             raise RuntimeError(f"Config file {given_configs.config} not exists")
 

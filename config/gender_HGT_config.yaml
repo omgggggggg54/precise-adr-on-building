@@ -14,7 +14,6 @@ hid_dim: 512
 in_drop: 0.3
 info_loss_weight: 0.9
 k: 10
-log_dir: ./log/
 loss: focal
 loss_weight: null
 lr: 0.0005

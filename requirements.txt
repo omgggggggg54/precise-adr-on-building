@@ -1,0 +1,22 @@
+# ===== PreciseADR 必需依赖（主流程 + 数据脚本）=====
+numpy
+pandas
+scipy
+scikit-learn
+statsmodels
+pyyaml
+tqdm
+easydict
+rich
+
+# ===== 训练与图模型 =====
+torch
+torchvision
+torchaudio
+pytorch-lightning
+torchmetrics
+torch-geometric
+
+# 如果你使用 GPU + PyG，通常还需要安装对应 CUDA/torch 版本的以下包：
+# pyg-lib, torch-scatter, torch-sparse, torch-cluster, torch-spline-conv
+# 可参考项目 README 中的安装命令。

@@ -15,148 +15,186 @@ from torch_geometric import transforms as T
 from torch_geometric.data import HeteroData
 from torch_geometric.data import InMemoryDataset
 from torch_geometric.loader import NeighborLoader
-from torch_geometric.transforms import BaseTransform
 from tqdm import tqdm
 
+from dataset.transforms import *
+
 home_path = os.getenv("HOME")
-
 base_path = osp.dirname(__file__)
-
+# ============================================================================
+# 异构图节点特征说明
+# ============================================================================
+# 图包含 4 种节点类型：
+#
+# 1. patient（患者）
+#    - x: 节点索引 (0 ~ N-1)
+#    - bow_feat: BOW 向量，形状 (N, in_dim)。其中值为 1 的位置表示：
+#        * 前 47 维：个人信息桶（性别/体重/年龄离散编码）
+#        * 接着 num_indications 维：适应症 one-hot
+#        * 接着 num_drugs 维：药物 one-hot
+#        * 最后 num_SE 维：副作用（本节点全 0）
+#    - y: 多标签副作用标签，形状 (N, num_SE)，multi-hot
+#    - num_info: 47（个人信息特征长度）
+#    - country / date: 用于按区域/时间切分
+#
+# 2. indication（适应症）
+#    - x: 节点索引
+#    - bow_feat: one-hot，位置 = 47 + indication_id
+#
+# 3. drug（药物）
+#    - x: 节点索引
+#    - bow_feat: one-hot，位置 = 47 + num_indications + drug_id
+#
+# 4. SE（副作用）
+#    - x: 节点索引
+#    - bow_feat: one-hot，位置 = 47 + num_indications + num_drugs + se_id
+#
+# 模型使用时，从 batch.node_types 收集各节点的 bow_feat 构成 x_dict，
+# 然后分别投影（SE 用独立投影层，其余共享）再通过异构卷积更新表示。
+# ============================================================================
 
 class InfoMapping(object):
-    num_elements = 1 + 3 + 30 + 13  # num_unknown + num_gender + num_weight + num_age
+    # 个人信息特征总长度：
+    # 1 个 unknown 占位 + 3 个性别桶 + 30 个体重桶 + 13 个年龄桶。
+    num_elements = 1 + 3 + 30 + 13
 
     def rev_map(self, i):
-        if i == 0 or i == 1:  # 0 for unknown data, 1 for unknown gender
+        """把个人信息特征索引还原成可读文本。"""
+        if i == 0 or i == 1:
+            # 0 表示未知值占位，1 表示未知性别。
             return "unknown"
         elif i == 2:
             return "male"
         elif i == 3:
             return "female"
         elif 3 < i < (30 + 3 + 1):
+            # 体重按 10kg 分桶。
             return f"weight:{10 * (i - 4)}"
         elif self.num_elements > i >= (30 + 3 + 1):
+            # 年龄按 10 岁分桶。
             return f"age:{10 * (i - 30 - 3 - 1)}"
         else:
             raise RuntimeError(f"Wrong value:{i}")
 
     def map_gender(self, gender):
-        """
-        map gender in records to index in feature
-        :param gender:
-        :return:
-        """
+        """把性别值映射到特征索引。"""
+        # 原始值通常是 0/1，这里整体右移 1 给 unknown 预留位置。
         return int(gender) + 1
 
     def map_weight(self, weight):
-        """
-        map weight in records to index in feature
-        weight larger than 300 is mapped to 0
-        :param weight: weight (float) in records
-        :return:
-        """
+        """把体重映射到 10kg 粒度的离散桶。"""
         new_weight = int(float(weight))
+
+        # 超出合理范围的体重统一回落到 unknown 桶。
         if new_weight > 300:
             new_weight = 0
         if new_weight < 0:
             new_weight = 0
+
+        # 前面有 unknown 和 gender 的偏移，所以要额外加 4。
         return new_weight // 10 + 3 + 1
 
     def map_age(self, age):
-        """
-        map age in records to index in feature
-        age > 120 or age < 0  is mapped to -1
-        :param age:
-        :return:
-        """
+        """把年龄映射到 10 岁粒度的离散桶。"""
         new_age = int(float(age))
+
+        # 无效年龄统一映射到 unknown 桶。
         if new_age > 120 or new_age < 0:
             new_age = -1
+
+        # 这里依次跳过 unknown、gender、weight 这三段空间。
         return new_age // 10 + 1 + (3 + 30 + 1)
 
 
 class PLEASESource(InMemoryDataset):
+    """PLEASE 数据集的图构建入口，负责把原始病例记录转成异构图。"""
 
     def __init__(
             self,
-            root: str = f"{base_path}/../data/Data/curated",
-            n_data=0,
+            root: str = f"{base_path}/",#数据集根目录路径
+            n_data=0,#要使用的病例数量，0 表示使用全部。
             se_type="all",
-            force=False,
-            raw_filename=None
+            use_processed=True,#是否使用缓存图，False 则强制删除已处理文件。
+            transform=T.RandomNodeSplit(num_val=0.125, num_test=0.125)#变换（默认随机节点划分）。
     ):
-        self.raw_filename = raw_filename
         self.se_type = se_type
-        self.count = 0
-        self.n_data = n_data
+        self.count = 0#（当前处理进度）
+
+        # n_data=0 时读取全部样本，否则只保留最近的 n_data 条。
+        self.n_data = n_data if n_data > 0 else len(pickle.load(open(f"{root}/PLEASE-US-{self.se_type}.pk", 'rb')))
         self.root = root
 
-        self.pre_init()
+        # 个人信息映射器在整个数据集中共享。
+        self.info_mapping = InfoMapping()
 
-        if force:
-            # remove existed files.
+        if not use_processed:
+            # 强制重建时，先删除当前配置对应的 processed 文件。
+            # 这些文件位于 dataset/processed/*.pt，只是处理后的图数据缓存，不是模型权重。
+            # 删除后可回收磁盘空间；下次训练会自动重新处理并重建缓存
             filepath = os.path.join(root, "processed", self.processed_file_names[:-4] + "*")
             print(filepath)
-
-            for f in glob.glob(filepath):
+            for f in glob.glob(filepath):#返回所有匹配通配符的文件列表。
                 os.remove(f)
 
-        super(PLEASESource, self).__init__(root)
-        self.post_init()
+        super(PLEASESource, self).__init__(root, transform=transform)##如果缓存存在且 use_processed=True，直接加载缓存//如果缓存不存在或需要重新处理，则调用 self.process() 方法生成数据。
 
-    def pre_init(self):
-        """
-        process before extracting from origin AE reports. Load data and build maps,
-        :param root: file_path of AE reports
-        :return:
-        """
-        all_data = self._load_data()
-        if self.n_data == 0:
-            self.n_data = len(all_data)
+        # InMemoryDataset 初始化后会自动把 processed 文件读进来。slices用不上
+        # PyTorch 2.6 默认 weights_only=True，会拦截 HeteroData 反序列化，这里显式关闭。
+        self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
+        #self.data 是一个 HeteroData 对象，包含了整个异构图,data["node_type"] 来获取该节点类型的所有属性
+        self.num_feat = self.data["patient"].bow_feat.size(1)#患者节点的 BoW 特征维度，即全局特征空间的维度（人口学 + 适应症数 + 药物数 + 副作用数）
+        self.num_se = self.data["patient"].y.size(1)#副作用类别的总数，即多标签分类的输出维度
 
-        # Feature index -> Feature name
-        self.global_map = {}
-        # personal infos
-        self.info_mapping = InfoMapping()
+        # 收集索引映射，方便后续做特征解释。
+        self.collect_maps()
+
+    def collect_maps(self):
+        """整理统一 BOW 特征索引到真实语义的映射。
+        global_map存各个特征(编号)->真实意义(name)"""
         self.num_infos = self.info_mapping.num_elements
 
-        # AE/SE map, Indication map, Drug map
-        self.build_map(all_data)
+        # global_map 负责从全局列索引反查具体特征含义。
+        self.global_map = {}
 
+        self.i_map = self.data["patient"].i_map
+        self.se_map = self.data["patient"].se_map
+        self.d_map = self.data["patient"].d_map
+
+        # 反向映射方便从整数 id 找回原始实体名。
+        self.d_map_rev = {v: k for k, v in self.d_map.items()}
+        self.i_map_rev = {v: k for k, v in self.i_map.items()}
+        self.se_map_rev = {v: k for k, v in self.se_map.items()}
+
+        # 先填个人信息区间。
         for i in range(self.info_mapping.num_elements):
             self.global_map[i] = self.info_mapping.rev_map(i)
 
+        # indication 特征紧跟在个人信息之后。
         offset = self.info_mapping.num_elements
         for i, i_name in enumerate(self.i_map):
             self.global_map[i + offset] = i_name
 
+        # drug 特征继续顺延。
         offset += len(self.i_map)
         for i, d_name in enumerate(self.d_map):
             self.global_map[i + offset] = d_name
-
-    def post_init(self):
-        self.data, self.slices = torch.load(self.processed_paths[0])
-        self.num_feat = self.data["patient"].bow_feat.size(1)
-        self.num_se = self.data["patient"].y.size(1)
-
+     
     @property
     def processed_file_names(self) -> str:
-        return f'PLEASE_{self.se_type}_v1_{self.n_data}.pt'
+        """processed 文件名由副作用类型和样本数共同决定。
+        属性会在每次实例化 PLEASESource 时被触发"""
+        #父类 InMemoryDataset 会根据这个属性自动生成 self.processed_paths
+        #self.processed_dir = os.path.join(self.root, 'processed')
+        return f'PLEASE_{self.se_type}_v2_{self.n_data}.pt'
 
     @property
     def raw_file_names(self) -> List[str]:
-        if self.raw_filename is None:
-            return [f'PLEASE-US-{self.se_type}.pk']
-        else:
-            return [self.raw_filename]
+        """原始数据文件名。_load_data() 使用了 raw_file_names"""
+        return [f'PLEASE-US-{self.se_type}.pk']
 
     def _build_person_graph(self, record):
-        """
-        transfer a record in FAERS to a subgraph
-        :param record: An AE record
-        :return:
-        """
-        if self.count % 100 == 0:
+        """把单条病例转成 patient 节点、边和标签所需的中间结果。"""
+        if self.count % 1000 == 0:
             print(f"{self.count}/{self.n_data}")
 
         infos = []
@@ -164,79 +202,101 @@ class PLEASESource(InMemoryDataset):
         p_i_edge_index = [[], []]
         p_d_edge_index = [[], []]
 
-        # 1. get infos from record
+        # 1. 取出集合类信息并去重。
         indications = set(record["indications"])
         drugs = set(record["drugs"])
         se = set(record["SE"])
 
-        # 2. get infos
+        # 这两个字段不参与当前 BOW 编码，但后续切分会用到。
+        country = record["country"]
+        receipt_date = record["receipt_date"]
+
+        # 2. 把个人信息编码成离散索引。
         gender = record["gender"]
         age = record["age"]
         weight = record["weight"]
         infos.append(self.info_mapping.map_gender(gender))
         infos.append(self.info_mapping.map_weight(weight))
         infos.append(self.info_mapping.map_age(age))
-        # todo add country ?
-        infos.append(0)
-        # country = record["country"]
 
-        # 3. get edge_index
+        # 3. 构建 patient -> indication 边。
         for i in indications:
             p_i_edge_index[0].append(self.count)
             p_i_edge_index[1].append(self.i_map[i])
 
+        # 4. 构建 patient -> drug 边。
         for d in drugs:
             p_d_edge_index[0].append(self.count)
             p_d_edge_index[1].append(self.d_map[d])
 
+        # attrs 记录 patient BOW 特征中哪些列需要置 1。
+        # 这里保留原实现，只把前两个个人信息索引写进 attrs。
         attrs.extend(infos[:-1])
+
+        # indication / drug 节点的 id 需要加上各自前缀偏移，才能映射到统一特征空间。
         attrs.extend(np.array(p_i_edge_index[1]) + self.info_mapping.num_elements)
         attrs.extend(np.array(p_d_edge_index[1]) + self.info_mapping.num_elements + len(self.i_map))
 
-        # origin SE id
+        # 5. 把原始 SE 编码映射成连续标签 id。
         se_list = list(se)
-        # new id
         new_se_list = []
         for each in se_list:
             new_se_list.append(self.se_map[each])
 
         self.count += 1
-        return torch.LongTensor(infos).unsqueeze(0), torch.LongTensor(p_i_edge_index), \
-            torch.LongTensor(p_d_edge_index), se_list, new_se_list, attrs
+        return (
+            torch.LongTensor(infos).unsqueeze(0),
+            torch.LongTensor(p_i_edge_index),
+            torch.LongTensor(p_d_edge_index),
+            new_se_list,
+            attrs,
+            country,
+            receipt_date
+        )
 
     def build_base_graph(self):
-        """
-        build the base graph, which consists of SE, Indication, Drug nodes.
-        :return:
-        """
+        """构建不依赖 patient 的基础异构图骨架。"""
         num_se = len(self.se_map)
         num_indication = len(self.i_map)
         num_drug = len(self.d_map)
 
+        # 统一输入维度 = 个人信息 + indication + drug + SE。
         self.in_dim = self.info_mapping.num_elements + num_se + num_indication + num_drug
 
+        # x 存实体顺序 id，bow_feat 才是真正给模型用的输入特征。
         self.hetero_graph["SE"].x = torch.arange(num_se)
         self.hetero_graph["indication"].x = torch.arange(num_indication)
         self.hetero_graph["drug"].x = torch.arange(num_drug)
 
+        # indication 的 one-hot 区间从个人信息之后开始。
         self.hetero_graph["indication"].bow_feat = one_hot(
-            torch.arange(num_indication) + self.info_mapping.num_elements,  # Tensor + offset
-            num_classes=self.in_dim).float().to_sparse()
+            torch.arange(num_indication) + self.info_mapping.num_elements,
+            num_classes=self.in_dim
+        ).float().to_sparse()
 
+        # drug 的 one-hot 区间再往后顺延 num_indication 个位置。
         self.hetero_graph["drug"].bow_feat = one_hot(
-            torch.arange(num_drug) + self.info_mapping.num_elements + num_indication,  # Tensor + offset
-            num_classes=self.in_dim).float().to_sparse()
+            torch.arange(num_drug) + self.info_mapping.num_elements + num_indication,
+            num_classes=self.in_dim
+        ).float().to_sparse()
 
+        # SE 的 one-hot 区间位于统一特征空间的最后一段。
         self.hetero_graph["SE"].bow_feat = one_hot(
-            torch.arange(num_se) + self.info_mapping.num_elements + num_indication + num_drug,  # Tensor + offset
-            num_classes=self.in_dim).float().to_sparse()
+            torch.arange(num_se) + self.info_mapping.num_elements + num_indication + num_drug,
+            num_classes=self.in_dim
+        ).float().to_sparse()
 
     def _load_data(self):
+        """读取原始 pickle 数据，并按 receipt_date 升序排序。"""
         filename = f"{self.root}/{self.raw_file_names[0]}"
         assert osp.exists(filename), f"{filename} doesn't exist in path {self.root}."
+
         all_pd = pickle.load(open(filename, 'rb'))
+        all_pd = all_pd.sort_values(by="receipt_date")
 
         assert len(all_pd) > 0, "No data!!!"
+
+        # 只保留时间上最新的 n_data 条样本。
         if self.n_data > 0:
             all_pd = all_pd.tail(self.n_data)
         else:
@@ -246,7 +306,13 @@ class PLEASESource(InMemoryDataset):
         return all_pd
 
     def process(self):
-        all_pd = self.all_pd
+        """InMemoryDataset 预处理入口。"""
+        all_pd = self._load_data()
+        if self.n_data == 0:
+            self.n_data = len(all_pd)
+
+        # 先建立 SE / indication / drug 的全局映射。
+        self.build_map(all_pd)
 
         print("Generating Personal Graph START!!!!!")
         print("data size:", len(all_pd))
@@ -255,31 +321,39 @@ class PLEASESource(InMemoryDataset):
         self.build_base_graph()
         self.extract_patient_graph(all_pd)
 
+        # 最终把完整异构图保存到 processed 文件。
         torch.save(self.collate([self.hetero_graph]), self.processed_paths[0])
-
+        #可以存储多个图,期望接收list
     def extract_patient_graph(self, all_pd):
-        info_nodes_list = []
-        se_name_index = []
+        """遍历所有病例，补齐 patient 节点的特征、边、标签和附加属性。"""
+        count = 0
+
         se_id_list = []
         all_p_i_edge_index = []
         all_p_d_edge_index = []
         all_y = []
-        count = 0
         all_feats = []
-        for info_nodes, p_i_edge_index, p_d_edge_index, se_name, se_id, attrs in tqdm(
+        all_country = []
+        all_date = []
+
+        # apply 会逐条调用 _build_person_graph，并返回当前病例对应的图元素。
+        for info_nodes, p_i_edge_index, p_d_edge_index, se_id, attrs, country, receipt_date in tqdm(
                 all_pd.apply(self._build_person_graph, axis=1)):
-            info_nodes_list.append(info_nodes)
             all_p_i_edge_index.append(p_i_edge_index)
             all_p_d_edge_index.append(p_d_edge_index)
-            se_name_index.append(se_name)  # old id
-            se_id_list.append(se_id)  # new id
+            se_id_list.append(se_id)
+
+            # patient 的监督标签是 multi-hot，因为一条记录可能对应多个 SE。
             y = torch.zeros(1, len(self.se_map))
             y[0, se_id] = 1
             all_y.append(y)
+
             all_feats.append(attrs)
+            all_country.append(country)
+            all_date.append(receipt_date)
             count += 1
 
-        # BOW Feature
+        # 把“激活列索引列表”恢复成真正的 BOW 向量。
         all_x = []
         for attr in all_feats:
             x = torch.zeros([self.in_dim])
@@ -287,66 +361,63 @@ class PLEASESource(InMemoryDataset):
             all_x.append(x)
         x = torch.stack(all_x, dim=0)
 
-
         self.hetero_graph["patient"].x = torch.arange(count)
         self.hetero_graph["patient"].num_info = self.info_mapping.num_elements
         self.hetero_graph["patient", "p_i", "indication"].edge_index = torch.cat(all_p_i_edge_index, dim=1)
         self.hetero_graph["patient", "p_d", "drug"].edge_index = torch.cat(all_p_d_edge_index, dim=1)
         self.hetero_graph["patient"].y = torch.cat(all_y, dim=0).to_sparse()
-        self.hetero_graph["patient"].ses = se_id_list
-        self.hetero_graph["patient"].se_names = se_name_index
-
         self.hetero_graph["patient"].bow_feat = x.to_sparse()
 
+        # 地区和时间保留下来，给按地区/时间切分的数据增强使用。
+        self.hetero_graph["patient"].country = all_country
+        self.hetero_graph["patient"].date = all_date
+
+        # 同时把映射表挂到 patient 上，方便外部统一读取。
+        self.hetero_graph["patient"].se_map = self.se_map
+        self.hetero_graph["patient"].d_map = self.d_map
+        self.hetero_graph["patient"].i_map = self.i_map
+
     def build_map(self, all_pd):
+        """扫描全量数据，建立实体名称到连续 id 的映射。"""
         self.se_map = OrderedDict()
         self.i_map = OrderedDict()
         self.d_map = OrderedDict()
 
-        save_path = f"{base_path}/{self.raw_file_names[0]}_map.pth"
-        if os.path.exists(save_path):
-            self.se_map, self.i_map, self.d_map = torch.load(save_path)
+        def build_se(x):
+            se = set(x["SE"])
+            se = list(se)
+            se.sort()
+            for each in se:
+                if each not in self.se_map:
+                    self.se_map[each] = len(self.se_map)
+            return 1
 
-        else:
-            def build_se(x):
-                se = set(x["SE"])
-                se = list(se)
-                se.sort()
-                for each in se:
-                    if each not in self.se_map:
-                        self.se_map[each] = len(self.se_map)
+        def build_indication_map(x):
+            indications = set(x["indications"])
+            indications = list(indications)
+            indications.sort()
+            for each in indications:
+                if each not in self.i_map:
+                    self.i_map[each] = len(self.i_map)
+            return 1
 
-                return 1
+        def build_drug_map(x):
+            drugs = list(set(x["drugs"]))
+            drugs.sort()
+            for each in drugs:
+                if each not in self.d_map:
+                    self.d_map[each] = len(self.d_map)
+            return 1
 
-            def build_indication_map(x):
-                indications = set(x["indications"])
-                indications = list(indications)
-                indications.sort()
-                for each in indications:
-                    if each not in self.i_map:
-                        self.i_map[each] = len(self.i_map)
-
-                return 1
-
-            def build_drug_map(x):
-                drugs = list(set(x["drugs"]))
-                drugs.sort()
-                for each in drugs:
-                    if each not in self.d_map:
-                        self.d_map[each] = len(self.d_map)
-
-                return 1
-
-            all_pd.apply(build_se, axis=1)
-            all_pd.apply(build_indication_map, axis=1)
-            all_pd.apply(build_drug_map, axis=1)
-
-        self.d_map_rev = {v: k for k, v in self.d_map.items()}
-        self.i_map_rev = {v: k for k, v in self.i_map.items()}
-        self.se_map_rev = {v: k for k, v in self.se_map.items()}
+        # 这里借助 apply 逐行遍历数据，不关心返回值本身。
+        all_pd.apply(build_se, axis=1)
+        all_pd.apply(build_indication_map, axis=1)
+        all_pd.apply(build_drug_map, axis=1)
 
 
 class DataModule(LightningDataModule):
+    """Lightning 数据模块，负责数据准备、切分和邻居采样。"""
+
     def __init__(
             self,
             n_data=10000,
@@ -356,7 +427,8 @@ class DataModule(LightningDataModule):
             split="in_order",
             to_homo=False,
             filtered_SE=None,
-            use_processed=True,
+            use_processed=False,
+            se_type="all",
             args=None,
     ):
         super().__init__()
@@ -364,7 +436,7 @@ class DataModule(LightningDataModule):
         self.args = args
 
         if self.args is None:
-            self.args = edict()
+            self.args = edict()#纯字典
 
         if hasattr(args, "filtered_SE"):
             self.filtered_SE = args.filtered_SE
@@ -374,7 +446,7 @@ class DataModule(LightningDataModule):
         self.dataset = None
         self.setup_over = False
         self.num_neigh = args.num_neigh if hasattr(args, "num_neigh") else 10
-        self.se_type = args.se_type if hasattr(args, "se_type") else "all"
+        self.se_type = args.se_type if hasattr(args, "se_type") else se_type
 
         self.to_homo = to_homo
         self.n_data = n_data
@@ -385,30 +457,24 @@ class DataModule(LightningDataModule):
         self.num_train_per_class = self.args.num_train_per_class if hasattr(self.args, "num_train_per_class") else 10
         self.seed = self.args.seed if hasattr(self.args, "seed") else 123
 
-        if not self.use_processed:
-            data_path = self.get_final_filename()
-            if os.path.exists(data_path):
-                os.remove(data_path)
-        self.load_processed()
+        # 初始化阶段就加载一次，保证外部立刻能读到 data 和索引边界。
+        self.load()
         self.setup_over = True
 
-    def load_processed(self):
-        data_path = self.get_final_filename()
-
-        if os.path.exists(data_path):
-            self.data = torch.load(data_path)
-        else:
-            self.setup()
-            if self.to_homo:
-                self.data.bow_feat = self.data.bow_feat.to_sparse()
-                self.data.y = self.data.y.to_sparse()
-            else:
-                for nt in self.data.node_types:
-                    self.data[nt].bow_feat = self.data[nt].bow_feat.to_sparse()
-                self.data["patient"].y = self.data["patient"].y.to_sparse()
-            torch.save(self.data, data_path)
+    def load(self):
+        """加载数据，并把稀疏特征切换成训练更常用的 dense 表示。"""
+        self.setup()
 
         if self.to_homo:
+            self.data.bow_feat = self.data.bow_feat.to_sparse()
+            self.data.y = self.data.y.to_sparse()
+        else:
+            for nt in self.data.node_types:
+                self.data[nt].bow_feat = self.data[nt].bow_feat.to_sparse()
+            self.data["patient"].y = self.data["patient"].y.to_sparse()
+
+        if self.to_homo:
+            # 同构图模式直接处理整体特征和标签。
             self.data.bow_feat = self.data.bow_feat.to_dense()
             self.data.y = self.data.y.to_dense()
         else:
@@ -417,6 +483,7 @@ class DataModule(LightningDataModule):
             n_d = self.data["drug"].bow_feat.size(0)
             n_se = self.data["SE"].bow_feat.size(0)
 
+            # 通过特征段长度反推出 indication / drug 在统一 BOW 中的位置范围。
             self.i_start = n_feat - n_se - n_d - n_i
             self.i_end = n_feat - n_se - n_d
             self.d_start = n_feat - n_se - n_d
@@ -426,17 +493,8 @@ class DataModule(LightningDataModule):
                 self.data[nt].bow_feat = self.data[nt].bow_feat.to_dense()
             self.data["patient"].y = self.data["patient"].y.to_dense()
 
-        del self.data["patient"].ses
-        del self.data["patient"].se_names
-
-    def get_final_filename(self):
-        prefix = "homo" if self.to_homo else "hetero"
-        data_path = f"{base_path}/{prefix}_{self.se_type}_{self.n_data}_{self.split}_" \
-                    f"{self.num_train_per_class}_{self.seed}_add_se_{self.add_SE}.pth"
-        print("load data from:", data_path)
-        return data_path
-
     def to_hetero_data(self):
+        """保持异构图结构不变，并记录必要元信息。"""
         assert self.data is not None
         num_info = self.data["patient"].num_info
         self.node_types, self.edge_types = self.data.metadata()
@@ -446,72 +504,105 @@ class DataModule(LightningDataModule):
         return self.data
 
     def to_homo_data(self):
+        """把异构图转换成同构图，并补齐统一字段。"""
         assert self.data is not None
         num_info = self.data["patient"].num_info
         node_types, edge_types = self.data.metadata()
         y = self.data['patient'].y.clone()
         n_se = y.size(1)
         old_bow_size = self.data["patient"].bow_feat.size(1)
+
         for nt in node_types:
             data_size = self.data[nt].x.size(0)
+
             if nt != "patient":
+                # 非 patient 节点没有真实标签，这里补零只是为了统一字段结构。
                 self.data[nt].y = torch.zeros([data_size, n_se])
                 self.data[nt].train_mask = torch.zeros([data_size], dtype=torch.bool)
                 self.data[nt].val_mask = torch.zeros([data_size], dtype=torch.bool)
                 self.data[nt].test_mask = torch.zeros([data_size], dtype=torch.bool)
+
             if nt != "SE":
+                # 非 SE 节点在扩展后的 SE 标签区间全部填 0。
                 self.data[nt].bow_feat = torch.cat([self.data[nt].bow_feat, torch.zeros([data_size, n_se])], dim=-1)
 
         n_se = self.data["SE"].bow_feat.size(0)
+
+        # SE 节点单独补一个单位阵，让每个 SE 节点在扩展后的尾部区间有唯一编码。
         self.data["SE"].bow_feat = torch.cat([torch.zeros([n_se, old_bow_size]), torch.eye(n_se)], dim=-1)
         print(self.data)
+
         homo_data = self.data.to_homogeneous()
         homo_data.num_info = num_info
         return homo_data
 
     def save_labels(self):
-        train_mask, val_mask, test_mask \
-            = self.data["patient"].train_mask, self.data["patient"].val_mask, self.data["patient"].test_mask
+        """保存当前 patient 节点的 train/val/test mask。"""
+        train_mask, val_mask, test_mask = (
+            self.data["patient"].train_mask,
+            self.data["patient"].val_mask,
+            self.data["patient"].test_mask
+        )
         f_name = f"{self.split}_{self.n_data}_label_mask.pth"
         torch.save([train_mask, val_mask, test_mask], f_name)
 
     def get_data_info(self):
+        """整理图解释和训练阶段会用到的边界信息。"""
+        # country/date 主要给特殊切分逻辑用，常规训练里删掉可以减少无关负担。
+        del self.dataset.data["patient"].country
+        del self.dataset.data["patient"].date
+
         self.i_start = self.dataset.info_mapping.num_elements
         self.i_end = self.i_start + len(self.dataset.i_map)
         self.d_start = self.i_end
         self.d_end = self.i_end + len(self.dataset.d_map)
+
         self.dataset.data["patient"].y = self.dataset.data["patient"].y.to_dense()
         for n_type in self.dataset.data.node_types:
             self.dataset.data[n_type].bow_feat = self.dataset.data[n_type].bow_feat.to_dense()
         self.in_dim = self.dataset.data["patient"].bow_feat.size(1)
 
     def load_data(self):
+        """按当前配置实例化 PLEASESource。"""
         if self.dataset is None:
-            self.dataset = PLEASESource(n_data=self.n_data, se_type=self.se_type, force=not self.use_processed)
+            self.dataset = PLEASESource(
+                n_data=self.n_data,
+                se_type=self.se_type,
+                use_processed=self.use_processed,
+                transform=self.transform
+            )
             self.get_data_info()
         return self.dataset
 
     def prepare_data(self):
+        """Lightning 约定接口，用于提前触发数据准备。"""
         return self.load_data()
 
     def setup(self, stage: Optional[str] = None):
+        """构建 transform、加载数据，并按需求转成异构图或同构图。"""
         if not self.setup_over:
-            # 1. load data
-            self.dataset = self.load_data()
-            self.data = self.dataset.data
+            transform_list = []
 
-            # 2. label split
+            # 1. 先定义标签切分策略。
             if self.split == "in_order":
-                self.data = FaersRandomNodeSplit()(self.data)
+                transform_list.append(FaersRandomNodeSplit())
             elif self.split == "by_label":
-                self.data = FaersNodeSplitByLabel(num_train_per_class=self.num_train_per_class)(self.data)
+                transform_list.append(FaersNodeSplitByLabel(num_train_per_class=self.num_train_per_class))
             else:
-                self.data = T.RandomNodeSplit(num_val=0.125, num_test=0.125)(self.data)
-            # 3. Add SE nodes
+                transform_list.append(T.RandomNodeSplit(num_val=0.125, num_test=0.125))
+
+            # 2. 可选：把训练标签显式加入图结构。
             if self.add_SE:
-                self.data = AddSEEdges()(self.data)
-            # 4. Add reverse links
-            self.data = T.ToUndirected(merge=False)(self.data)
+                transform_list.append(AddSEEdges())
+
+            # 3. 最后补反向边，让消息传递双向可达。
+            transform_list.append(T.ToUndirected(merge=False))
+
+            self.transform = T.Compose(transform_list)
+
+            # transform 会在访问 dataset[0] 时真正生效。
+            self.dataset = self.load_data()
+            self.data = self.dataset[0]
 
             if self.to_homo:
                 self.data = self.to_homo_data()
@@ -519,193 +610,69 @@ class DataModule(LightningDataModule):
                 self.data = self.to_hetero_data()
 
             if not self.to_homo:
-                print(self.data.metadata)
-                self.metadata = self.data.metadata
-
+                print(self.data.metadata) 
+                self.metadata = self.data.metadata  # metadata = (node_types, edge_types)
+                                                    # 例如: (['patient', 'drug', 'indication', 'SE'], 
+                                                    #[('patient','p_i','indication'), ('patient','p_d','drug'), ...])
             print("Validation:", self.data.validate())
-
             self.setup_over = True
 
     def dataloader(self, mask: Tensor, shuffle: bool, num_workers: int = 8, mode="train"):
+        """根据 patient 掩码构建邻居采样 dataloader。"""
         batch_size = self.batch_size
-        if self.to_homo:
 
-            dataloader = NeighborLoader(self.data, num_neighbors=[self.num_neigh] * (self.n_layer),
-                                        input_nodes=mask, batch_size=batch_size,
-                                        shuffle=shuffle, num_workers=num_workers,
-                                        persistent_workers=num_workers > 0)
+        if self.to_homo:
+            dataloader = NeighborLoader(
+                self.data,
+                num_neighbors=[self.num_neigh] * self.n_layer,
+                input_nodes=mask,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                persistent_workers=num_workers > 0
+            )
         else:
-            dataloader = NeighborLoader(self.data, num_neighbors=[self.num_neigh] * (self.n_layer),
-                                        input_nodes=('patient', mask), batch_size=batch_size,
-                                        shuffle=shuffle, num_workers=num_workers,
-                                        persistent_workers=num_workers > 0)
-            # dataloader.batch_size = batch_size
+            # 异构图模式下，需要明确告诉采样器监督目标是 patient 节点。
+            dataloader = NeighborLoader(
+                self.data,#HeteroData 实例
+                num_neighbors=[self.num_neigh] * self.n_layer,#生成一个列表，例如 [10, 10] 表示第一层采 10 个邻居，第二层再采 10 个邻居。
+                input_nodes=('patient', mask),#指定采样的起始节点集合。
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                persistent_workers=num_workers > 0#是否保持 worker 进程在 epoch 之间存活。
+            )
+
+            # 手动保留 input_nodes，方便调试时直接查看。
             dataloader.input_nodes = ('patient', mask)
 
-        dataloader.num_neighbors = [self.num_neigh] * (self.n_layer)
+        dataloader.num_neighbors = [self.num_neigh] * self.n_layer
         return dataloader
 
     def train_dataloader(self):
+        """训练集采样器。trainer.fit每个epoch调用"""
         if self.to_homo:
             return self.dataloader(self.data.train_mask, shuffle=True)
         else:
             return self.dataloader(self.data['patient'].train_mask, shuffle=True)
 
     def val_dataloader(self):
+        """验证集采样器。trainer.validate每个epoch调用"""
         if self.to_homo:
             return self.dataloader(self.data.val_mask, shuffle=False)
         else:
             return self.dataloader(self.data['patient'].val_mask, shuffle=False)
 
     def test_dataloader(self):
+        """测试集采样器。trainer.test每个epoch调用"""
         if self.to_homo:
             return self.dataloader(self.data.test_mask, shuffle=False)
         else:
             return self.dataloader(self.data['patient'].test_mask, shuffle=False)
 
 
-class FaersRandomNodeSplit(BaseTransform):
-    def __init__(self,
-                 split="in_order",
-                 num_val=0.25,
-                 num_test=0.25,
-                 merge_seen_and_train=True
-                 ):
-        self.merge_seen_and_train = merge_seen_and_train
-        self.num_val = num_val
-        self.num_test = num_test
-        self.split = split
-        super(FaersRandomNodeSplit, self).__init__()
-
-    def __call__(
-            self,
-            data,
-    ):
-        # only faers nodes has label
-        num_faers = data["patient"].x.size(0)
-        num_seen = num_faers // 2
-
-        seen_mask = torch.zeros(num_faers, dtype=torch.bool)
-        train_mask = torch.zeros(num_faers, dtype=torch.bool)
-        val_mask = torch.zeros(num_faers, dtype=torch.bool)
-        test_mask = torch.zeros(num_faers, dtype=torch.bool)
-
-        if isinstance(self.num_val, float):
-            num_val = round((num_faers - num_seen) * self.num_val)
-        else:
-            num_val = self.num_val
-
-        if isinstance(self.num_test, float):
-            num_test = round((num_faers - num_seen) * self.num_test)
-        else:
-            num_test = self.num_test
-
-        assert num_test < num_faers
-        assert num_val < num_faers
-
-        if self.split == "in_order":
-            test_mask[-num_test:] = True
-            val_mask[-num_test - num_val:-num_test] = True
-            train_mask[-(num_faers - num_seen):-num_test - num_val] = True
-            seen_mask[-num_faers:-(num_faers - num_seen)] = True
-        else:
-            perm = torch.randperm(num_faers)
-            val_mask[perm[:num_val]] = True
-            test_mask[perm[num_val:num_val + num_test]] = True
-            train_mask[perm[num_val + num_test:-num_seen]] = True
-            seen_mask[perm[-num_seen:]] = True
-
-        if self.merge_seen_and_train:
-            train_mask = torch.logical_or(train_mask, seen_mask)
-
-        data["patient"].train_mask, data["patient"].val_mask, data[
-            "patient"].test_mask = train_mask, val_mask, test_mask
-        data["patient"].seen_mask = seen_mask
-        return data
-
-
-class FaersNodeSplitByLabel(FaersRandomNodeSplit):
-    """
-     num_train_per_class for train
-    25% for validation
-    rest for test
-    """
-
-    def __init__(self,
-                 split="in_order",
-                 num_train_per_class=10,
-                 num_val=0.25
-                 ):
-        self.split = split
-        self.num_val = num_val
-        self.num_train_per_class = num_train_per_class
-        super(FaersNodeSplitByLabel, self).__init__()
-
-    def __call__(
-            self,
-            data,
-    ):
-        # only faers nodes has label
-        num_faers = data["patient"].x.size(0)
-
-        train_mask = torch.zeros(num_faers, dtype=torch.bool)
-        val_mask = torch.zeros(num_faers, dtype=torch.bool)
-        test_mask = torch.zeros(num_faers, dtype=torch.bool)
-
-        if isinstance(self.num_val, float):
-            num_val = round(num_faers * self.num_val)
-        else:
-            num_val = self.num_val
-
-        assert num_val < num_faers
-
-        y = data["patient"].y
-        num_classes = y.size(1)
-
-        for c in range(num_classes):
-            idx = (y[:, c] == 1).nonzero(as_tuple=False).view(-1)
-            idx = idx[torch.randperm(idx.size(0))]
-            idx = idx[:self.num_train_per_class]
-            train_mask[idx] = True
-
-        remaining = (~train_mask).nonzero(as_tuple=False).view(-1)
-        remaining = remaining[torch.randperm(remaining.size(0))]
-
-        val_mask[remaining[:num_val]] = True
-        test_mask[remaining[num_val:]] = True
-
-        data["patient"].train_mask, data["patient"].val_mask, data[
-            "patient"].test_mask = train_mask, val_mask, test_mask
-        data["patient"].seen_mask = train_mask
-        return data
-
-
-class AddSEEdges(BaseTransform):
-    def __call__(
-            self,
-            data,
-    ):
-        if ("patient", "p_se", "SE") in data:
-            return data
-        # mask = data["patient"].seen_mask if hasattr(data["patient"], "seen_mask") else data["patient"].train_mask
-        mask = data["patient"].train_mask
-
-        new_edges_index = []
-        aim_nodes = data["patient"].x[mask].tolist()
-
-        for node in aim_nodes:
-            # dst = data["patient"].ses[node]
-            dst = data["patient"].y[node]
-            dst = (torch.arange(len(dst))[dst.ge(1)]).tolist()
-
-            src = [node] * len(dst)
-            new_edges_index.append(
-                torch.stack([torch.LongTensor(src), torch.LongTensor(dst)])
-            )
-        data["patient", "p_se", "SE"].edge_index = torch.cat(new_edges_index, dim=1)
-        return data
-
-
 if __name__ == '__main__':
-    dataset = PLEASESource(n_data=0, force=True)
-    DataModule(n_data=0, use_processed=False)
+    # 手动触发一次重建流程，便于离线检查数据处理是否正常。
+    for se_type in ["all", "gender", "age"]:
+        dataset = PLEASESource(n_data=0, use_processed=False, se_type=se_type)
+        DataModule(n_data=0, use_processed=True, se_type=se_type)

@@ -1,7 +1,7 @@
 run.sh
 test/*
 */*.log
-data/Data/*
+data/
 log/
 .idea/
 *.log
@@ -10,3 +10,11 @@ log/
 baselines/*
 analyse/*
 /analyse/
+.DS_Store
+ablation_study/
+*.md
+data/
+association_mining/
+new_data_in/
+LICENSE
+__pycache__/

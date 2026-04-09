@@ -1,11 +1,11 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+'''实现 InfoNCE 损失函数，用于对比学习。'''
 __all__ = ['InfoNCE', 'info_nce']
 
 
-class InfoNCE(nn.Module):
+class InfoNCE(nn.Module):#未使用
     """
     Calculates the InfoNCE loss for self-supervised learning.
     This contrastive loss enforces the embeddings of similar (positive) samples to be close

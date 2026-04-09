@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torchmetrics
 from torch.nn import functional as F
-
+'''辅助指标（检索 Hit Rate、NDCG、Precision/Recall）和 Focal Loss。'''
 
 class RetrievalHitRate(object):
     def __init__(self, k=1, compute_on_cpu=True):
@@ -14,6 +14,24 @@ class RetrievalHitRate(object):
         metrics = []
         for i in range(y_hat.size(0)):
             hit_k = torchmetrics.functional.retrieval_hit_rate(y_hat[i], y[i], top_k=self.k)
+            metrics.append(hit_k.item())
+
+        self.value = np.mean(metrics)
+
+    def __float__(self):
+        return self.value
+
+
+class RetrievalNormalizedDCG(float):
+    def __init__(self, k=1, compute_on_cpu=True):
+        self.k = k
+        self.compute_on_cpu = compute_on_cpu
+        self.value = 0
+
+    def __call__(self, y_hat, y, indexes=None):
+        metrics = []
+        for i in range(y_hat.size(0)):
+            hit_k = torchmetrics.functional.retrieval_normalized_dcg(y_hat[i], y[i], top_k=self.k)
             metrics.append(hit_k.item())
 
         self.value = np.mean(metrics)
