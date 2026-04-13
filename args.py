@@ -12,7 +12,8 @@ def register_args(parser, config_file="config/all_HGT_config.yaml"):
     parser.add_argument("--k", type=int, default=10)
 
     parser.add_argument("--n_mlp", type=int, default=3)
-    parser.add_argument("--n_gnn", type=int, default=3)
+    # 按当前复现目标，默认使用 1 层图传播。
+    parser.add_argument("--n_gnn", type=int, default=1)
     parser.add_argument("--loss", type=str, default="ce")
     parser.add_argument("--info_loss_weight", type=float, default=0.5)
     parser.add_argument("--loss_weight", type=list, default=None)
@@ -49,23 +50,23 @@ def register_args(parser, config_file="config/all_HGT_config.yaml"):
 
 
 def parse_args_and_yaml(given_parser):
-    '''先按默认设置args,然后yaml文件覆盖,最后是命令行输入覆盖'''
+    '''优先级：硬编码默认值 → yaml文件 → 命令行参数'''
 
-    given_configs, remaining = given_parser.parse_known_args()#只获取args已经设置的参数项
-    if given_configs.config:
-        if os.path.exists(given_configs.config):
-            with open(given_configs.config, 'r', encoding='utf-8') as f:
+    # 仅用于获取 --config 参数位置
+    args_config, _ = given_parser.parse_known_args()
+    
+    # 根据 yaml 配置更新默认值
+    if args_config.config:
+        if os.path.exists(args_config.config):
+            with open(args_config.config, 'r', encoding='utf-8') as f:
                 cfg = yaml.safe_load(f)
-                given_parser.set_defaults(**cfg)#set_defaults 不检查参数是否提前定义过，会直接添加属性。
+                given_parser.set_defaults(**cfg)
         else:
-            raise RuntimeError(f"Config file {given_configs.config} not exists")
+            raise RuntimeError(f"Config file {args_config.config} not exists")
 
-    # The main arg parser parses the rest of the args, the usual
-    # defaults will have been overridden if config file specified.
-    args = given_parser.parse_args(remaining)
+    # 重新解析所有参数（应用了 yaml 的默认值后，命令行参数最终覆盖）
+    args = given_parser.parse_args()
 
-    # Cache the args as a text string to save them in the output dir later
+    # 保存参数快照为文本
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
-    # print(args_text)
     return args
-

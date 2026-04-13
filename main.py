@@ -33,6 +33,8 @@ def build_dataset_func(args):
             split=args.split,
             n_data=args.n_data,
             add_SE=args.add_SE,
+            # 这里显式使用 processed 缓存，避免默认值变化影响复现结果。
+            use_processed=True,
             args=args
         )
     else:
@@ -130,7 +132,11 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, n_device=1, 
     print(args.model_name)
 
     # 训练结束后，再单独跑一次验证集，拿到最终最佳模型对应的验证指标。
-    max_val_score = trainer.validate(dataloaders=datamodule.val_dataloader())
+    # 显式指定 best checkpoint，避免 Lightning 走隐式回退逻辑。
+    max_val_score = trainer.validate(
+        dataloaders=datamodule.val_dataloader(),
+        ckpt_path=checkpoint_callback.best_model_path
+    )
     val_score = max_val_score[0]['val_auc']
 
     # 手动保存最后一个 epoch 的模型（与 best 模型分开存）。

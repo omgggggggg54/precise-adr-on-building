@@ -86,69 +86,57 @@ class PreciseADR_RGCN(nn.Module):
         """把输入 BOW 特征映射到隐藏空间。"""
         x = self.in_lin(x)
         return x
-#x_dict:Dict[str, Tensor],edge_index_dict:Dict[Tuple[str,str,str], Tensor]
+
     def forward(self, x_dict, edge_index_dict, return_hidden=False):
         """前向传播，同时支持返回对比学习所需的中间隐藏向量。"""
-        if "info_nodes" in x_dict:
-            # 这两个字段不是模型真正使用的特征，提前移除避免误传。
-            x_dict.pop("info_nodes")
+        # 为了避免直接改动调用方传入的字典，这里先复制。
+        x_dict = dict(x_dict)
+        edge_index_dict = dict(edge_index_dict)
 
+        if "info_nodes" in x_dict:
+            x_dict.pop("info_nodes")
         if "attrs" in x_dict:
             x_dict.pop("attrs")
 
         batch_size = -1
         if "batch_size" in x_dict:
-            #本次 batch 要训练的 patient（前 batch_size 个,作为邻居被采样进来的 patient（后面的）
             batch_size = x_dict.pop("batch_size")
 
-        # 基于 patient 原始输入构造增强视图和辅助投影，用于对比学习。
+        # 对比学习分支：基于原始 patient 特征构造增强视图和辅助投影。
         x_aug = self.build_aug(x_dict["patient"][:batch_size])
         hid_aug = self.cl_lin(x_aug)
         hid_assis = self.cl_lin(x_dict["patient"][:batch_size])
 
-        # SE节点类型走不同的输入投影分支。
+        # 节点输入编码：SE 走独立投影，其它节点共享 in_lin。
         for node_type in self.node_types:
             if node_type == "SE":
                 x_dict[node_type] = self.se_trans(x_dict[node_type])
             else:
                 x_dict[node_type] = self._build_x_feat(x_dict[node_type])
 
-        res = [x_dict["patient"]]
-
+        # 训练时可选丢弃一部分 patient-SE 边，降低标签边泄露。
         if self.args.add_SE:
-            # 如果显式加入了 patient -> SE 标签边，这里训练时再随机丢弃一部分。
             edge_index = edge_index_dict[("patient", "p_se", "SE")]
-            edge_mask = torch.ones(edge_index.size(1))
+            edge_mask = torch.ones(edge_index.size(1), device=edge_index.device)
             edge_mask = self.edge_drop(edge_mask).bool()
             edge_index = edge_index[:, edge_mask]
             edge_index_dict[("patient", "p_se", "SE")] = edge_index
-
-            # 同步更新反向边，保证图结构双向一致。
             edge_index_dict[("SE", "rev_p_se", "patient")] = edge_index[[1, 0], :]
 
-        for i, conv in enumerate(self.convs):
-            # 先计算当前层卷积输出。
-            tmp_x_dict = conv(x_dict, edge_index_dict)
-
-            # 某些节点类型如果这一层没有被更新，就保留一份非线性变换后的旧特征。
+        # 图传播：按层更新 x_dict，与你说的 x_dict=tmp_dict 保持一致。
+        for conv in self.convs:
+            next_x_dict = conv(x_dict, edge_index_dict)
             for key in x_dict:
-                if key not in tmp_x_dict:
-                    tmp_x_dict[key] = nn.Tanh()(x_dict[key])
+                if key not in next_x_dict:
+                    next_x_dict[key] = nn.Tanh()(x_dict[key])
+            x_dict = next_x_dict
 
-            # 关键修复：把本层输出回写，下一层才会继续聚合多跳邻域信息。
-            x_dict = tmp_x_dict
-            # res 列表会保存每一层（包括原始输入）的 patient 表示
-            res.append(x_dict["patient"])
-
-        # 只取种子 patient 对应的前 batch_size 个表示做监督。
         hidden = x_dict["patient"][:batch_size]
-
-        # 分类头把 patient 表示与辅助投影相加，再映射到标签空间。
         x = self.readout(hidden + hid_assis)
+
         if return_hidden:
             return x, hidden, hid_assis, hid_aug
-        else:
-            return x
+        return x
 
 
 class PreciseADR_HGT(PreciseADR_RGCN):
@@ -166,10 +154,12 @@ class PreciseADR_HGT(PreciseADR_RGCN):
             self.convs.append(conv)
 
     def forward(self, x_dict, edge_index_dict, return_hidden=False):
-        """HGT 版本前向传播，整体流程与 RGCN 版本保持一致。"""
+        """HGT 前向传播。"""
+        x_dict = dict(x_dict)
+        edge_index_dict = dict(edge_index_dict)
+
         if "info_nodes" in x_dict:
             x_dict.pop("info_nodes")
-
         if "attrs" in x_dict:
             x_dict.pop("attrs")
 
@@ -177,7 +167,7 @@ class PreciseADR_HGT(PreciseADR_RGCN):
         if "batch_size" in x_dict:
             batch_size = x_dict.pop("batch_size")
 
-        x_aug = self.build_aug(x_dict["patient"][:batch_size])
+        x_aug = self.build_aug(x_dict["patient"][:batch_size])#增强视图的输入特征，原始特征上随机补 1
         hid_aug = self.cl_lin(x_aug)
         hid_assis = self.cl_lin(x_dict["patient"][:batch_size])
 
@@ -187,27 +177,27 @@ class PreciseADR_HGT(PreciseADR_RGCN):
             else:
                 x_dict[node_type] = self._build_x_feat(x_dict[node_type])
 
-        res = [x_dict["patient"]]
-        for i, conv in enumerate(self.convs):
-            # HGTConv 会基于节点类型和边类型做类型感知的消息传递。
-            tmp_x_dict = conv(x_dict, edge_index_dict)
+        if self.args.add_SE:
+            edge_index = edge_index_dict[("patient", "p_se", "SE")]
+            edge_mask = torch.ones(edge_index.size(1), device=edge_index.device)
+            edge_mask = self.edge_drop(edge_mask).bool()
+            edge_index = edge_index[:, edge_mask]
+            edge_index_dict[("patient", "p_se", "SE")] = edge_index
+            edge_index_dict[("SE", "rev_p_se", "patient")] = edge_index[[1, 0], :]
 
-            # 没有更新到的节点类型沿用旧表示。
+        for conv in self.convs:
+            next_x_dict = conv(x_dict, edge_index_dict)
             for key in x_dict:
-                if key not in tmp_x_dict:
-                    tmp_x_dict[key] = x_dict[key]
-
-            # 关键修复：把本层输出回写，保证多层 HGT 的层间传播。
-            x_dict = tmp_x_dict
-            res.append(x_dict["patient"])
+                if key not in next_x_dict:
+                    next_x_dict[key] = x_dict[key]
+            x_dict = next_x_dict
 
         hidden = x_dict["patient"][:batch_size]
         x = self.readout(hidden + hid_assis)
 
         if return_hidden:
-            return x, hidden, hid_assis, hid_aug
-        else:
-            return x
+            return x, hidden, hid_assis, hid_aug#原始BOW特征的投影hid_assis|增强视图的投影hid_aug
+        return x
 
 #从base里import
 #lambda意义在def 某个函数(args):return PreciseADR_RGCN(参数...)

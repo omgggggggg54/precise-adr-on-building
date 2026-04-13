@@ -427,7 +427,8 @@ class DataModule(LightningDataModule):
             split="in_order",
             to_homo=False,
             filtered_SE=None,
-            use_processed=False,
+            # 默认优先复用已经处理好的图缓存，和原版行为保持一致。
+            use_processed=True,
             se_type="all",
             args=None,
     ):
