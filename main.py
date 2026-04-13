@@ -1,8 +1,8 @@
 import os
 import datetime
 import argparse
+import csv
 
-import yaml
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
@@ -12,7 +12,7 @@ from models.hetero_cl import *
 from root_utils import seed_everything, build_save_path
 
 # main_eval.py 或 main.py 最开头（import 后）
-import os, argparse, torch
+import torch
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 torch.serialization.add_safe_globals([argparse.Namespace])
 
@@ -75,8 +75,8 @@ def build_dataset_func(args):
     return datamodule
 
 
-def main(args, other_callbacks=[], dataset_func=build_dataset_func, n_device=1, model_wrapper=ContrastiveWrapper,
-         remove_file=False, device="gpu"):
+def main(args, other_callbacks=[], dataset_func=build_dataset_func, model_wrapper=ContrastiveWrapper,
+         remove_file=False):
     """执行一次完整的训练、验证、测试与预测导出流程。"""
     print(args.seed)
 
@@ -96,6 +96,11 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, n_device=1, 
     # 先构建数据模块，再根据已经补齐的 args 初始化模型。
     datamodule = dataset_func(args)
     model = model_wrapper(model_name=args.model_name, args=args)
+    # 统一按 args.device 判定训练设备，避免 main_eval 漏传参数时走错设备。
+    accelerator = "gpu" if ("cuda" in str(args.device).lower() and torch.cuda.is_available()) else "cpu"
+    devices = 1
+    # 这里打印一次关键设备信息，日志里能直接确认是否真的在用 GPU。
+    print(f"trainer device => args.device={args.device}, accelerator={accelerator}, devices={devices}")
 
     # 监控 val_auc，保存验证集最优模型。
     checkpoint_callback = ModelCheckpoint(
@@ -115,12 +120,14 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, n_device=1, 
 
     # Lightning Trainer 负责统一调度训练、验证、测试和预测流程。
     trainer = Trainer(
-        accelerator=device,
-        devices=n_device,
+        accelerator=accelerator,
+        devices=devices,
         max_epochs=args.max_epochs,
         # max_epochs=1,
         # auto_select_gpus=True,
         check_val_every_n_epoch=args.eval_step,
+        log_every_n_steps=1,
+        enable_progress_bar=True,
         callbacks=callbacks,
         num_sanity_val_steps=0,
         # logger=False
@@ -134,6 +141,7 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, n_device=1, 
     # 训练结束后，再单独跑一次验证集，拿到最终最佳模型对应的验证指标。
     # 显式指定 best checkpoint，避免 Lightning 走隐式回退逻辑。
     max_val_score = trainer.validate(
+        model=model,
         dataloaders=datamodule.val_dataloader(),
         ckpt_path=checkpoint_callback.best_model_path
     )
@@ -145,14 +153,15 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, n_device=1, 
     args.best_ckpt_path = checkpoint_callback.best_model_path
 
     # 测试集评估。
-    max_test_score = trainer.test(dataloaders=datamodule.test_dataloader(), ckpt_path=args.best_ckpt_path)
+    max_test_score = trainer.test(model=model, dataloaders=datamodule.test_dataloader(), ckpt_path=args.best_ckpt_path)
+    test_score = max_test_score[0] if len(max_test_score) > 0 else {}
 
     if remove_file:
         # 某些场景只关心分数，不保留 ckpt 文件。
         os.remove(args.save_path)
     else:
         # 额外导出测试集预测结果，方便离线分析。
-        res = trainer.predict(model, dataloaders=datamodule.test_dataloader(), ckpt_path=args.best_ckpt_path)
+        res = trainer.predict(model=model, dataloaders=datamodule.test_dataloader(), ckpt_path=args.best_ckpt_path)
         pred_path = os.path.join(pred_dir, f"test_pred_{args.run_id}.pth")
         torch.save(res, pred_path)
 
@@ -166,7 +175,7 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, n_device=1, 
         f.write(f"best_ckpt: {args.best_ckpt_path}\n")
         f.write(f"last_ckpt: {args.save_path}\n")
         f.write(f"val_auc: {val_score}\n")
-        f.write(f"test_metrics: {max_test_score[0] if len(max_test_score) > 0 else {}}\n")
+        f.write(f"test_metrics: {test_score}\n")
         f.write("\n")
         f.write("params:\n")
         for k in [
@@ -174,6 +183,25 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, n_device=1, 
             "n_data", "num_neigh", "lr", "weight_decay", "dropout", "add_SE", "device"
         ]:
             f.write(f"{k}: {getattr(args, k, None)}\n")
+    # 统一维护一个总索引表，后续找最优权重/指标时不用翻目录。
+    run_index_path = os.path.join("outputs", "run_index.csv")
+    os.makedirs(os.path.dirname(run_index_path), exist_ok=True)
+    header = [
+        "run_id", "dataset", "model_name", "seed", "val_auc", "test_auc",
+        "best_ckpt", "last_ckpt", "report_path"
+    ]
+    row = [
+        args.run_id, args.dataset, args.model_name, args.seed, val_score, test_score.get("test_auc"),
+        args.best_ckpt_path, args.save_path, report_path
+    ]
+    need_header = not os.path.exists(run_index_path)
+    with open(run_index_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if need_header:
+            writer.writerow(header)
+        writer.writerow(row)
+    print(f"报告已保存: {report_path}")
+    print(f"索引已追加: {run_index_path}")
 
     return max_val_score, max_test_score
 

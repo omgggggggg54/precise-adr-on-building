@@ -1,6 +1,7 @@
 from main import *
 
 import datetime
+import time
 # main_eval.py 或 main.py 最开头（import 后）
 import os, argparse, torch
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
@@ -15,7 +16,9 @@ if __name__ == "__main__":
 
     for dataset in ["all", "gender", "age"]:
         for model_name in ["PreciseADR_HGT"]:
-            print(f"\n===== 开始评估数据集: {dataset} =====")
+            dataset_start_time = time.time()
+            start_clock = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n===== 开始评估数据集: {dataset} | start={start_clock} =====")
 
             parser = argparse.ArgumentParser(description="PreciseADR")#步骤1: 创建解析器
             register_args(parser, config_file=f"config/{dataset}_HGT_config.yaml")#注册参数（定义格子）register_args 直接修改 parser 对象
@@ -32,10 +35,12 @@ if __name__ == "__main__":
                 for i in range(1):
                     args.model_name = model_name
                     args.seed = seed + i
+                    print(f"[{dataset}] run-{i} 开始 | model={args.model_name} | seed={args.seed}")
 
                     res = main(args, model_wrapper=ContrastiveWrapper)
                     print(args)
                     print(dataset, args.model_name, res)
+                    print(f"[{dataset}] run-{i} 完成 | best_ckpt={getattr(args, 'best_ckpt_path', None)}")
                     result_key = f"{dataset}-{args.model_name}_run-{i}"
                     res_dict[result_key] = res
                     overall_res_dict[result_key] = res
@@ -43,7 +48,9 @@ if __name__ == "__main__":
                 print(e)
                 raise e
             finally:
+                dataset_cost = time.time() - dataset_start_time
                 print(f"===== 数据集 {dataset} 评估完成 =====")
+                print(f"===== 数据集 {dataset} 耗时: {dataset_cost:.1f}s =====")
                 print(res_dict)
                 result_path = os.path.join(job_dir, f"eval_result_{overall_job_id}.pth")
                 torch.save(res_dict, result_path)
