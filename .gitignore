@@ -13,8 +13,12 @@ analyse/*
 .DS_Store
 ablation_study/
 *.md
-data/
 association_mining/
 new_data_in/
 LICENSE
 __pycache__/
+
+# 取反规则（必须写完整路径）
+!所作所为.md
+!new_data_in/refined_data/drugbank_id_smiles.csv
+!data/Data/all_ready_pk/

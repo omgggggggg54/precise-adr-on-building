@@ -67,7 +67,9 @@ if __name__ == "__main__":
                     f.write("params:\n")
                     for k in [
                         "seed", "batch_size", "n_gnn", "n_mlp", "max_epochs", "eval_step", "split",
-                        "n_data", "num_neigh", "lr", "weight_decay", "dropout", "add_SE", "device"
+                        "n_data", "num_neigh", "lr", "weight_decay", "dropout", "add_SE", "device",
+                        "use_drug_struct", "drug_encoder_type", "drug_struct_dim", "drug_smiles_csv",
+                        "molformer_feat_path", "use_time_feature", "time_dim"
                     ]:
                         f.write(f"{k}: {getattr(args, k, None)}\n")
 

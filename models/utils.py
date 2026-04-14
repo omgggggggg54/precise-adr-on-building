@@ -1,7 +1,12 @@
 import numpy as np
 import torch
-import torchmetrics
 from torch.nn import functional as F
+from torchmetrics.retrieval import (
+    retrieval_hit_rate,
+    retrieval_normalized_dcg,
+    retrieval_precision,
+    retrieval_recall,
+)
 '''辅助指标（检索 Hit Rate、NDCG、Precision/Recall）和 Focal Loss。'''
 
 class RetrievalHitRate(object):
@@ -13,7 +18,8 @@ class RetrievalHitRate(object):
     def __call__(self, y_hat, y, indexes=None):
         metrics = []
         for i in range(y_hat.size(0)):
-            hit_k = torchmetrics.functional.retrieval_hit_rate(y_hat[i], y[i], top_k=self.k)
+            # 使用 torchmetrics 新接口，避免 functional 入口弃用警告。
+            hit_k = retrieval_hit_rate(y_hat[i], y[i], top_k=self.k)
             metrics.append(hit_k.item())
 
         self.value = np.mean(metrics)
@@ -31,7 +37,7 @@ class RetrievalNormalizedDCG(float):
     def __call__(self, y_hat, y, indexes=None):
         metrics = []
         for i in range(y_hat.size(0)):
-            hit_k = torchmetrics.functional.retrieval_normalized_dcg(y_hat[i], y[i], top_k=self.k)
+            hit_k = retrieval_normalized_dcg(y_hat[i], y[i], top_k=self.k)
             metrics.append(hit_k.item())
 
         self.value = np.mean(metrics)
@@ -49,7 +55,7 @@ class RetrievalPrecision(float):
     def __call__(self, y_hat, y, indexes=None):
         metrics = []
         for i in range(y_hat.size(0)):
-            hit_k = torchmetrics.functional.retrieval_precision(y_hat[i], y[i], top_k=self.k)
+            hit_k = retrieval_precision(y_hat[i], y[i], top_k=self.k)
             metrics.append(hit_k.item())
 
         self.value = np.mean(metrics)
@@ -67,7 +73,7 @@ class RetrievalRecall(float):
     def __call__(self, y_hat, y, indexes=None):
         metrics = []
         for i in range(y_hat.size(0)):
-            hit_k = torchmetrics.functional.retrieval_recall(y_hat[i], y[i], top_k=self.k)
+            hit_k = retrieval_recall(y_hat[i], y[i], top_k=self.k)
             metrics.append(hit_k.item())
 
         self.value = np.mean(metrics)

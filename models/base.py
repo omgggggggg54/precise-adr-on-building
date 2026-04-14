@@ -17,6 +17,24 @@ from torchmetrics.classification import MultilabelAUROC, MultilabelPrecision, Mu
 from models.utils import RetrievalHitRate, RetrievalPrecision, RetrievalRecall, FocalLoss, RetrievalNormalizedDCG
 
 
+class Time2Vec(nn.Module):
+    """Time2Vec：把标量时间编码为周期+线性混合表示。"""
+
+    def __init__(self, out_dim: int):
+        super().__init__()
+        assert out_dim >= 2, "time_dim 至少为 2"
+        self.linear = nn.Linear(1, 1)
+        self.periodic = nn.Linear(1, out_dim - 1)
+
+    def forward(self, t: Tensor) -> Tensor:
+        t = t.float()
+        if t.dim() == 1:
+            t = t.unsqueeze(-1)
+        linear_part = self.linear(t)
+        periodic_part = torch.sin(self.periodic(t))
+        return torch.cat([linear_part, periodic_part], dim=-1)
+
+
 class BasicEncoder(nn.Module):
     """一个简化的前馈编码块，结构类似 Transformer FFN + 残差归一化。"""
 
@@ -114,6 +132,10 @@ class PreciseADR_RGCN(nn.Module):
         self.n_layer = self.args.n_gnn
         self.n_gnn = args.n_gnn
         self.n_mlp = args.n_mlp if hasattr(args, "n_mlp") else 1
+        self.use_time_feature = bool(getattr(args, "use_time_feature", True))
+        self.time_dim = int(getattr(args, "time_dim", 32))
+        self.use_drug_struct = bool(getattr(args, "use_drug_struct", True)) and int(getattr(args, "drug_struct_dim", 0)) > 0
+        self.drug_struct_dim = int(getattr(args, "drug_struct_dim", 0))
 
         # 先把统一 BOW 特征投影到隐藏空间。
         nn_layers = []
@@ -136,13 +158,46 @@ class PreciseADR_RGCN(nn.Module):
             })
             self.convs.append(conv)
 
+        # 时间编码：先做 Time2Vec，再投影回统一输入维度，与 patient 输入相加。
+        self.time_encoder = Time2Vec(self.time_dim)
+        self.time_proj = nn.Sequential(
+            nn.Linear(self.time_dim, self.in_dim),
+            nn.Tanh(),
+            nn.Dropout(args.dropout),
+        )
+
+        # 药物结构编码：把结构向量投影到统一输入维度，与 drug 输入相加。
+        if self.use_drug_struct:
+            self.drug_struct_proj = nn.Sequential(
+                nn.Linear(self.drug_struct_dim, self.in_dim),
+                nn.Tanh(),
+                nn.Dropout(args.dropout),
+            )
+        else:
+            self.drug_struct_proj = None
+
     def _build_x_feat(self, x):
         """把原始输入特征投影到模型隐藏空间。"""
         x = self.in_lin(x)
         return x
 
+    def _inject_aux_features(self, x_dict, patient_time=None, drug_struct_feat=None):
+        """把时间和药物结构特征注入到原始输入空间。"""
+        if self.use_time_feature and patient_time is not None and "patient" in x_dict:
+            time_emb = self.time_proj(self.time_encoder(patient_time))
+            x_dict["patient"] = x_dict["patient"] + time_emb
+
+        if self.use_drug_struct and self.drug_struct_proj is not None and drug_struct_feat is not None and "drug" in x_dict:
+            struct_emb = self.drug_struct_proj(drug_struct_feat.float())
+            x_dict["drug"] = x_dict["drug"] + struct_emb
+
+        return x_dict
+
     def forward(self, x_dict, edge_index_dict, return_hidden=False):
         """异构图前向传播。"""
+        patient_time = x_dict.pop("patient_time", None)
+        drug_struct_feat = x_dict.pop("drug_struct_feat", None)
+
         if "info_nodes" in x_dict:
             x_dict.pop("info_nodes")
 
@@ -153,6 +208,13 @@ class PreciseADR_RGCN(nn.Module):
         if "batch_size" in x_dict:
             # 取出种子节点数量，后面只对这部分 patient 做监督。
             batch_size = x_dict.pop("batch_size")
+
+        # 先把辅助特征注入到 BOW 空间，再做共享投影。
+        x_dict = self._inject_aux_features(
+            x_dict=x_dict,
+            patient_time=patient_time,
+            drug_struct_feat=drug_struct_feat,
+        )
 
         # 所有节点类型共享同一套输入投影。
         for node_type in self.node_types:
@@ -196,6 +258,9 @@ class PreciseADR_HGT(PreciseADR_RGCN):
 
     def forward(self, x_dict, edge_index_dict, return_hidden=False):
         """HGT 前向传播。"""
+        patient_time = x_dict.pop("patient_time", None)
+        drug_struct_feat = x_dict.pop("drug_struct_feat", None)
+
         if "info_nodes" in x_dict:
             x_dict.pop("info_nodes")
 
@@ -205,6 +270,12 @@ class PreciseADR_HGT(PreciseADR_RGCN):
         batch_size = -1
         if "batch_size" in x_dict:
             batch_size = x_dict.pop("batch_size")
+
+        x_dict = self._inject_aux_features(
+            x_dict=x_dict,
+            patient_time=patient_time,
+            drug_struct_feat=drug_struct_feat,
+        )
 
         for node_type in self.node_types:
             x_dict[node_type] = self._build_x_feat(x_dict[node_type])
@@ -334,6 +405,11 @@ class BasicModelWrapper(LightningModule):
         # 整理成底层模型需要的 x_dict 结构。
         for n_type in batch.node_types:
             x_dict[n_type] = batch[n_type].bow_feat
+        # 注入时间和药物结构特征。
+        if "time_days" in batch["patient"]:
+            x_dict["patient_time"] = batch["patient"].time_days
+        if "drug" in batch.node_types and "struct_feat" in batch["drug"]:
+            x_dict["drug_struct_feat"] = batch["drug"].struct_feat
 
         # 只取种子 patient 的标签，采样到的邻居不参与损失计算。
         y = batch['patient'].y[:batch_size]
@@ -476,8 +552,12 @@ class BasicModelWrapper(LightningModule):
         """手动把自定义字段一起搬到目标设备。"""
         for n_type in batch.node_types:
             batch[n_type].bow_feat = batch[n_type].bow_feat.to(device)
+            if "struct_feat" in batch[n_type]:
+                batch[n_type].struct_feat = batch[n_type].struct_feat.to(device)
 
         batch["patient"].y = batch["patient"].y.to(device)
+        if "time_days" in batch["patient"]:
+            batch["patient"].time_days = batch["patient"].time_days.to(device)
 
         # edge_index_dict 不是标准张量字段，这里手动逐项迁移。
         edge_index_dict = {k: v.to(device) for k, v in batch.edge_index_dict.items()}

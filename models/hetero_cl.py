@@ -7,7 +7,7 @@ from torch_geometric.data import Batch
 from torch_geometric.nn import HeteroConv, HGTConv, SAGEConv, GATConv
 
 from models.base import model_dict#变量import
-from .base import BasicModelWrapper
+from .base import BasicModelWrapper, Time2Vec
 from .info_nce import info_nce
 '''扩展模型，增加对比学习分支（InfoNCE）和对应的 Lightning 包装器（ContrastiveWrapper'''
 
@@ -30,6 +30,10 @@ class PreciseADR_RGCN(nn.Module):
         self.n_layer = self.args.n_gnn
         self.n_gnn = args.n_gnn
         self.n_mlp = args.n_mlp if hasattr(args, "n_mlp") else 1
+        self.use_time_feature = bool(getattr(args, "use_time_feature", True))
+        self.time_dim = int(getattr(args, "time_dim", 32))
+        self.use_drug_struct = bool(getattr(args, "use_drug_struct", True)) and int(getattr(args, "drug_struct_dim", 0)) > 0
+        self.drug_struct_dim = int(getattr(args, "drug_struct_dim", 0))
 
         # in_lin 把统一 BOW 输入先映射到隐藏空间，供大多数节点类型共享。
         nn_layers = []
@@ -70,6 +74,24 @@ class PreciseADR_RGCN(nn.Module):
         # aug_add 用于在 patient 输入上随机加激活，构造对比学习增强视图。
         self.aug_add = nn.Dropout(args.aug_add if hasattr(args, "aug_add") else 0.1)
 
+        # 时间编码：Time2Vec -> 投影回统一输入维度。
+        self.time_encoder = Time2Vec(self.time_dim)
+        self.time_proj = nn.Sequential(
+            nn.Linear(self.time_dim, self.in_dim),
+            nn.Tanh(),
+            nn.Dropout(args.dropout),
+        )
+
+        # 药物结构编码：投影后与 drug 输入相加。
+        if self.use_drug_struct:
+            self.drug_struct_proj = nn.Sequential(
+                nn.Linear(self.drug_struct_dim, self.in_dim),
+                nn.Tanh(),
+                nn.Dropout(args.dropout),
+            )
+        else:
+            self.drug_struct_proj = None
+
     def build_aug(self, x):
         """在输入特征上随机补 1，生成对比学习使用的增强视图。"""
         aug_x = torch.zeros_like(x)
@@ -87,11 +109,25 @@ class PreciseADR_RGCN(nn.Module):
         x = self.in_lin(x)
         return x
 
+    def _inject_aux_features(self, x_dict, patient_time=None, drug_struct_feat=None):
+        """把时间和药物结构信息注入到原始输入空间。"""
+        if self.use_time_feature and patient_time is not None and "patient" in x_dict:
+            time_emb = self.time_proj(self.time_encoder(patient_time))
+            x_dict["patient"] = x_dict["patient"] + time_emb
+
+        if self.use_drug_struct and self.drug_struct_proj is not None and drug_struct_feat is not None and "drug" in x_dict:
+            struct_emb = self.drug_struct_proj(drug_struct_feat.float())
+            x_dict["drug"] = x_dict["drug"] + struct_emb
+
+        return x_dict
+
     def forward(self, x_dict, edge_index_dict, return_hidden=False):
         """前向传播，同时支持返回对比学习所需的中间隐藏向量。"""
         # 为了避免直接改动调用方传入的字典，这里先复制。
         x_dict = dict(x_dict)
         edge_index_dict = dict(edge_index_dict)
+        patient_time = x_dict.pop("patient_time", None)
+        drug_struct_feat = x_dict.pop("drug_struct_feat", None)
 
         if "info_nodes" in x_dict:
             x_dict.pop("info_nodes")
@@ -101,6 +137,12 @@ class PreciseADR_RGCN(nn.Module):
         batch_size = -1
         if "batch_size" in x_dict:
             batch_size = x_dict.pop("batch_size")
+
+        x_dict = self._inject_aux_features(
+            x_dict=x_dict,
+            patient_time=patient_time,
+            drug_struct_feat=drug_struct_feat,
+        )
 
         # 对比学习分支：基于原始 patient 特征构造增强视图和辅助投影。
         x_aug = self.build_aug(x_dict["patient"][:batch_size])
@@ -157,6 +199,8 @@ class PreciseADR_HGT(PreciseADR_RGCN):
         """HGT 前向传播。"""
         x_dict = dict(x_dict)
         edge_index_dict = dict(edge_index_dict)
+        patient_time = x_dict.pop("patient_time", None)
+        drug_struct_feat = x_dict.pop("drug_struct_feat", None)
 
         if "info_nodes" in x_dict:
             x_dict.pop("info_nodes")
@@ -166,6 +210,12 @@ class PreciseADR_HGT(PreciseADR_RGCN):
         batch_size = -1
         if "batch_size" in x_dict:
             batch_size = x_dict.pop("batch_size")
+
+        x_dict = self._inject_aux_features(
+            x_dict=x_dict,
+            patient_time=patient_time,
+            drug_struct_feat=drug_struct_feat,
+        )
 
         x_aug = self.build_aug(x_dict["patient"][:batch_size])#增强视图的输入特征，原始特征上随机补 1
         hid_aug = self.cl_lin(x_aug)
@@ -241,6 +291,10 @@ class ContrastiveWrapper(BasicModelWrapper):
         # 将异构 batch 中每种节点的 bow_feat 整理成模型所需的 x_dict。
         for n_type in batch.node_types:
             x_dict[n_type] = batch[n_type].bow_feat
+        if "time_days" in batch["patient"]:
+            x_dict["patient_time"] = batch["patient"].time_days
+        if "drug" in batch.node_types and "struct_feat" in batch["drug"]:
+            x_dict["drug_struct_feat"] = batch["drug"].struct_feat
 
         # 只取种子 patient 的标签，邻居节点不参与当前 batch 的监督。
         y = batch['patient'].y[:batch_size]

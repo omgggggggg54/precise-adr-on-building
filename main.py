@@ -2,6 +2,7 @@ import os
 import datetime
 import argparse
 import csv
+import warnings
 
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
@@ -15,6 +16,14 @@ from root_utils import seed_everything, build_save_path
 import torch
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 torch.serialization.add_safe_globals([argparse.Namespace])
+
+
+def setup_warning_filters():
+    """全局关闭 warnings，保证终端输出干净。"""
+    warnings.filterwarnings("ignore")
+
+
+setup_warning_filters()
 
 def build_dataset_func(args):
     """根据参数构建数据模块，并把图结构相关维度回填到 `args`。"""
@@ -34,7 +43,7 @@ def build_dataset_func(args):
             n_data=args.n_data,
             add_SE=args.add_SE,
             # 这里显式使用 processed 缓存，避免默认值变化影响复现结果。
-            use_processed=True,
+            use_processed=False,
             args=args
         )
     else:
@@ -66,6 +75,11 @@ def build_dataset_func(args):
 
     # patient.bow_feat 的列数就是统一 BOW 特征空间的维度。
     args.num_feat = args.in_dim = data["patient"].bow_feat.size(1)
+    # 药物结构特征维度单独记录，供模型侧做结构投影。
+    if "struct_feat" in data["drug"]:
+        args.drug_struct_dim = data["drug"].struct_feat.size(1)
+    else:
+        args.drug_struct_dim = 0
 
     # 打印划分结果，便于确认当前 split 是否符合预期。
     print("train data size:", datamodule.data["patient"].train_mask.sum())
@@ -180,7 +194,9 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, model_wrappe
         f.write("params:\n")
         for k in [
             "batch_size", "n_gnn", "n_mlp", "max_epochs", "eval_step", "split",
-            "n_data", "num_neigh", "lr", "weight_decay", "dropout", "add_SE", "device"
+            "n_data", "num_neigh", "lr", "weight_decay", "dropout", "add_SE", "device",
+            "use_drug_struct", "drug_encoder_type", "drug_struct_dim", "drug_smiles_csv",
+            "molformer_feat_path", "use_time_feature", "time_dim"
         ]:
             f.write(f"{k}: {getattr(args, k, None)}\n")
     # 统一维护一个总索引表，后续找最优权重/指标时不用翻目录。
@@ -285,6 +301,8 @@ if __name__ == "__main__":
             f.write("params:\n")
             for k in [
                 "seed", "batch_size", "n_gnn", "n_mlp", "max_epochs", "eval_step", "split",
-                "n_data", "num_neigh", "lr", "weight_decay", "dropout", "add_SE", "device"
+                "n_data", "num_neigh", "lr", "weight_decay", "dropout", "add_SE", "device",
+                "use_drug_struct", "drug_encoder_type", "drug_struct_dim", "drug_smiles_csv",
+                "molformer_feat_path", "use_time_feature", "time_dim"
             ]:
                 f.write(f"{k}: {getattr(args, k, None)}\n")

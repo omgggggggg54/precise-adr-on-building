@@ -17,6 +17,7 @@ from torch_geometric.data import InMemoryDataset
 from torch_geometric.loader import NeighborLoader
 from tqdm import tqdm
 
+from dataset.mol_features import build_drug_struct_matrix
 from dataset.transforms import *
 
 home_path = os.getenv("HOME")
@@ -115,10 +116,23 @@ class PLEASESource(InMemoryDataset):
             n_data=0,#要使用的病例数量，0 表示使用全部。
             se_type="all",
             use_processed=True,#是否使用缓存图，False 则强制删除已处理文件。
-            transform=T.RandomNodeSplit(num_val=0.125, num_test=0.125)#变换（默认随机节点划分）。
+            transform=T.RandomNodeSplit(num_val=0.125, num_test=0.125),#变换（默认随机节点划分）。
+            args=None,
     ):
+        self.args = args if args is not None else edict()
         self.se_type = se_type
         self.count = 0#（当前处理进度）
+        project_root = osp.dirname(base_path)
+        default_smiles_csv = osp.join(project_root, "new_data_in", "refined_data", "drugbank_id_smiles.csv")
+
+        # 药物结构编码配置。
+        self.use_drug_struct = bool(getattr(self.args, "use_drug_struct", True))
+        self.drug_encoder_type = str(getattr(self.args, "drug_encoder_type", "hybrid"))
+        self.drug_struct_dim = int(getattr(self.args, "drug_struct_dim", 128))
+        self.drug_smiles_csv = str(getattr(self.args, "drug_smiles_csv", default_smiles_csv))
+        self.molformer_feat_path = str(getattr(self.args, "molformer_feat_path", ""))
+        # 时间特征开关（数据里始终会生成 time_days，模型侧按开关使用）。
+        self.use_time_feature = bool(getattr(self.args, "use_time_feature", True))
 
         # n_data=0 时读取全部样本，否则只保留最近的 n_data 条。
         self.n_data = n_data if n_data > 0 else len(pickle.load(open(f"{root}/PLEASE-US-{self.se_type}.pk", 'rb')))
@@ -185,7 +199,10 @@ class PLEASESource(InMemoryDataset):
         属性会在每次实例化 PLEASESource 时被触发"""
         #父类 InMemoryDataset 会根据这个属性自动生成 self.processed_paths
         #self.processed_dir = os.path.join(self.root, 'processed')
-        return f'PLEASE_{self.se_type}_v2_{self.n_data}.pt'
+        return (
+            f'PLEASE_{self.se_type}_v3_{self.n_data}_'
+            f'{int(self.use_drug_struct)}_{self.drug_encoder_type}_{self.drug_struct_dim}.pt'
+        )
 
     @property
     def raw_file_names(self) -> List[str]:
@@ -254,6 +271,16 @@ class PLEASESource(InMemoryDataset):
             receipt_date
         )
 
+    @staticmethod
+    def _date_to_day_index(date_value):
+        """把日期转成天粒度序号，便于后续做时序编码。"""
+        try:
+            # 统一到 day 精度，避免时分秒噪音。
+            day_val = np.datetime64(str(date_value), "D").astype("int64")
+            return int(day_val)
+        except Exception:
+            return 0
+
     def build_base_graph(self):
         """构建不依赖 patient 的基础异构图骨架。"""
         num_se = len(self.se_map)
@@ -279,6 +306,35 @@ class PLEASESource(InMemoryDataset):
             torch.arange(num_drug) + self.info_mapping.num_elements + num_indication,
             num_classes=self.in_dim
         ).float().to_sparse()
+
+        # 药物结构编码：把 DrugBank ID 对应的分子信息编码成定长向量。
+        if self.use_drug_struct:
+            ordered_drug_ids = [None] * num_drug
+            for drug_id, idx in self.d_map.items():
+                ordered_drug_ids[idx] = drug_id
+
+            struct_feat, struct_stat = build_drug_struct_matrix(
+                ordered_drug_ids=ordered_drug_ids,
+                smiles_csv_path=self.drug_smiles_csv,
+                encoder_type=self.drug_encoder_type,
+                struct_dim=self.drug_struct_dim,
+                molformer_feat_path=self.molformer_feat_path,
+            )
+            self.hetero_graph["drug"].struct_feat = torch.from_numpy(struct_feat).float()
+            print(
+                "[DrugStruct] mode:",
+                self.drug_encoder_type,
+                "| dim:",
+                self.drug_struct_dim,
+                "| total:",
+                struct_stat["total_drug"],
+                "| smiles_hit:",
+                struct_stat["hit_smiles"],
+                "| molformer_hit:",
+                struct_stat["hit_molformer"],
+                "| rdkit:",
+                struct_stat["rdkit_enabled"],
+            )
 
         # SE 的 one-hot 区间位于统一特征空间的最后一段。
         self.hetero_graph["SE"].bow_feat = one_hot(
@@ -335,6 +391,7 @@ class PLEASESource(InMemoryDataset):
         all_feats = []
         all_country = []
         all_date = []
+        all_day_index = []
 
         # apply 会逐条调用 _build_person_graph，并返回当前病例对应的图元素。
         for info_nodes, p_i_edge_index, p_d_edge_index, se_id, attrs, country, receipt_date in tqdm(
@@ -351,6 +408,7 @@ class PLEASESource(InMemoryDataset):
             all_feats.append(attrs)
             all_country.append(country)
             all_date.append(receipt_date)
+            all_day_index.append(self._date_to_day_index(receipt_date))
             count += 1
 
         # 把“激活列索引列表”恢复成真正的 BOW 向量。
@@ -371,6 +429,15 @@ class PLEASESource(InMemoryDataset):
         # 地区和时间保留下来，给按地区/时间切分的数据增强使用。
         self.hetero_graph["patient"].country = all_country
         self.hetero_graph["patient"].date = all_date
+        # 归一化后的时间特征，供模型做时序编码。
+        day_arr = np.array(all_day_index, dtype=np.float32)
+        if day_arr.size == 0:
+            time_days = np.zeros((count, 1), dtype=np.float32)
+        else:
+            min_day = float(day_arr.min())
+            span = max(float(day_arr.max()) - min_day, 1.0)
+            time_days = ((day_arr - min_day) / span).reshape(-1, 1)
+        self.hetero_graph["patient"].time_days = torch.from_numpy(time_days).float()
 
         # 同时把映射表挂到 patient 上，方便外部统一读取。
         self.hetero_graph["patient"].se_map = self.se_map
@@ -570,7 +637,8 @@ class DataModule(LightningDataModule):
                 n_data=self.n_data,
                 se_type=self.se_type,
                 use_processed=self.use_processed,
-                transform=self.transform
+                transform=self.transform,
+                args=self.args,
             )
             self.get_data_info()
         return self.dataset
