@@ -5,7 +5,7 @@ import csv
 import warnings
 
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, TQDMProgressBar
 
 from args import *
 from dataset.please import DataModule
@@ -130,6 +130,8 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, model_wrappe
     early_stop_callback = EarlyStopping(monitor='val_auc', mode="max", patience=args.patient)
 
     callbacks = [checkpoint_callback, early_stop_callback]
+    # 强制开启细粒度进度条，便于在终端持续看到训练推进。
+    callbacks.append(TQDMProgressBar(refresh_rate=1))
     callbacks.extend(other_callbacks)
 
     # Lightning Trainer 负责统一调度训练、验证、测试和预测流程。

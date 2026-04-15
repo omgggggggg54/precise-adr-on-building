@@ -18,6 +18,8 @@ def register_args(parser, config_file="config/all_HGT_config.yaml"):
     parser.add_argument("--info_loss_weight", type=float, default=0.5)
     parser.add_argument("--loss_weight", type=list, default=None)
     parser.add_argument("--num_neigh", type=int, default=10)
+    # DataLoader 并发进程数。大图场景默认 0 更稳，避免首个 batch 卡死。
+    parser.add_argument("--num_workers", type=int, default=0)
 
 
     # training related
@@ -27,6 +29,8 @@ def register_args(parser, config_file="config/all_HGT_config.yaml"):
     parser.add_argument("--show_training", type=bool, default=False)
     # parser.add_argument("--use_scheduler", type=bool, default=False)
     parser.add_argument("--use_scheduler", action="store_true", default=False)
+    # 是否在每个 batch 前后调用 empty_cache（默认关闭，避免训练显著变慢）。
+    parser.add_argument("--use_empty_cache_hook", type=bool, default=False)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--in_drop", type=float, default=0.3)
     parser.add_argument("--aug_add", type=float, default=0.3)

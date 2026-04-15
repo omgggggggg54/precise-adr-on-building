@@ -296,7 +296,7 @@ class ContrastiveWrapper(BasicModelWrapper):
         if "drug" in batch.node_types and "struct_feat" in batch["drug"]:
             x_dict["drug_struct_feat"] = batch["drug"].struct_feat
 
-        # 只取种子 patient 的标签，邻居节点不参与当前 batch 的监督。
+        # 只取种子 patient 的标签，邻居节点不参与当前 batch 的监督。标签是[num_SE节点数]的多标签二分类标签，patient节点的标签在batch['patient'].y中，邻居节点的标签不参与监督训练。
         y = batch['patient'].y[:batch_size]
         y_hat = self.model(x_dict, batch.edge_index_dict, return_hidden=return_hidden)
 

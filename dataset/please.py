@@ -145,7 +145,8 @@ class PLEASESource(InMemoryDataset):
             # 强制重建时，先删除当前配置对应的 processed 文件。
             # 这些文件位于 dataset/processed/*.pt，只是处理后的图数据缓存，不是模型权重。
             # 删除后可回收磁盘空间；下次训练会自动重新处理并重建缓存
-            filepath = os.path.join(root, "processed", self.processed_file_names[:-4] + "*")
+            # 文件后缀是 ".pt"，这里去掉后缀再拼 *，避免误删成 hybrid_12* 这种错误模式。
+            filepath = os.path.join(root, "processed", self.processed_file_names[:-3] + "*")
             print(filepath)
             for f in glob.glob(filepath):#返回所有匹配通配符的文件列表。
                 os.remove(f)
@@ -211,7 +212,8 @@ class PLEASESource(InMemoryDataset):
 
     def _build_person_graph(self, record):
         """把单条病例转成 patient 节点、边和标签所需的中间结果。"""
-        if self.count % 1000 == 0:
+        # 默认不刷屏；仅在 show_training=True 时输出粗粒度进度。
+        if bool(getattr(self.args, "show_training", False)) and self.count % 10000 == 0:
             print(f"{self.count}/{self.n_data}")
 
         infos = []
@@ -368,9 +370,10 @@ class PLEASESource(InMemoryDataset):
             self.n_data = len(all_pd)
 
         # 先建立 SE / indication / drug 的全局映射。
+        print("阶段 1/3：构建实体映射")
         self.build_map(all_pd)
 
-        print("Generating Personal Graph START!!!!!")
+        print("阶段 2/3：构建 patient 图")
         print("data size:", len(all_pd))
 
         self.hetero_graph = HeteroData()
@@ -378,6 +381,7 @@ class PLEASESource(InMemoryDataset):
         self.extract_patient_graph(all_pd)
 
         # 最终把完整异构图保存到 processed 文件。
+        print("阶段 3/3：保存 processed 图文件")
         torch.save(self.collate([self.hetero_graph]), self.processed_paths[0])
         #可以存储多个图,期望接收list
     def extract_patient_graph(self, all_pd):
@@ -393,9 +397,14 @@ class PLEASESource(InMemoryDataset):
         all_date = []
         all_day_index = []
 
-        # apply 会逐条调用 _build_person_graph，并返回当前病例对应的图元素。
-        for info_nodes, p_i_edge_index, p_d_edge_index, se_id, attrs, country, receipt_date in tqdm(
-                all_pd.apply(self._build_person_graph, axis=1)):
+        # 逐条病例构图，并显示明确进度条。
+        for _, row in tqdm(
+            all_pd.iterrows(),
+            total=len(all_pd),
+            desc="2.1/3 病例转图",
+            dynamic_ncols=True
+        ):
+            info_nodes, p_i_edge_index, p_d_edge_index, se_id, attrs, country, receipt_date = self._build_person_graph(row)
             all_p_i_edge_index.append(p_i_edge_index)
             all_p_d_edge_index.append(p_d_edge_index)
             se_id_list.append(se_id)
@@ -413,7 +422,7 @@ class PLEASESource(InMemoryDataset):
 
         # 把“激活列索引列表”恢复成真正的 BOW 向量。
         all_x = []
-        for attr in all_feats:
+        for attr in tqdm(all_feats, total=len(all_feats), desc="2.2/3 组装 patient 特征", dynamic_ncols=True):
             x = torch.zeros([self.in_dim])
             x[attr] = 1
             all_x.append(x)
@@ -449,37 +458,22 @@ class PLEASESource(InMemoryDataset):
         self.se_map = OrderedDict()
         self.i_map = OrderedDict()
         self.d_map = OrderedDict()
-
-        def build_se(x):
-            se = set(x["SE"])
-            se = list(se)
-            se.sort()
-            for each in se:
+        # 单趟扫描建立三类映射，并显示进度。
+        for _, row in tqdm(
+            all_pd.iterrows(),
+            total=len(all_pd),
+            desc="1/3 扫描 SE/indication/drug",
+            dynamic_ncols=True
+        ):
+            for each in sorted(set(row["SE"])):
                 if each not in self.se_map:
                     self.se_map[each] = len(self.se_map)
-            return 1
-
-        def build_indication_map(x):
-            indications = set(x["indications"])
-            indications = list(indications)
-            indications.sort()
-            for each in indications:
+            for each in sorted(set(row["indications"])):
                 if each not in self.i_map:
                     self.i_map[each] = len(self.i_map)
-            return 1
-
-        def build_drug_map(x):
-            drugs = list(set(x["drugs"]))
-            drugs.sort()
-            for each in drugs:
+            for each in sorted(set(row["drugs"])):
                 if each not in self.d_map:
                     self.d_map[each] = len(self.d_map)
-            return 1
-
-        # 这里借助 apply 逐行遍历数据，不关心返回值本身。
-        all_pd.apply(build_se, axis=1)
-        all_pd.apply(build_indication_map, axis=1)
-        all_pd.apply(build_drug_map, axis=1)
 
 
 class DataModule(LightningDataModule):
@@ -630,6 +624,14 @@ class DataModule(LightningDataModule):
             self.dataset.data[n_type].bow_feat = self.dataset.data[n_type].bow_feat.to_dense()
         self.in_dim = self.dataset.data["patient"].bow_feat.size(1)
 
+        # 这几个映射字典很大，训练采样阶段不需要，删除可减轻 DataLoader 负担。
+        if "se_map" in self.dataset.data["patient"]:
+            del self.dataset.data["patient"].se_map
+        if "d_map" in self.dataset.data["patient"]:
+            del self.dataset.data["patient"].d_map
+        if "i_map" in self.dataset.data["patient"]:
+            del self.dataset.data["patient"].i_map
+
     def load_data(self):
         """按当前配置实例化 PLEASESource。"""
         if self.dataset is None:
@@ -679,16 +681,20 @@ class DataModule(LightningDataModule):
                 self.data = self.to_hetero_data()
 
             if not self.to_homo:
-                print(self.data.metadata) 
-                self.metadata = self.data.metadata  # metadata = (node_types, edge_types)
-                                                    # 例如: (['patient', 'drug', 'indication', 'SE'], 
-                                                    #[('patient','p_i','indication'), ('patient','p_d','drug'), ...])
+                # 只打印精简后的元信息，避免超大对象打印拖慢日志。
+                self.metadata = self.data.metadata()
+                print("node_types:", self.metadata[0])
+                print("edge_types:", self.metadata[1])
             print("Validation:", self.data.validate())
             self.setup_over = True
 
-    def dataloader(self, mask: Tensor, shuffle: bool, num_workers: int = 8, mode="train"):
+    def dataloader(self, mask: Tensor, shuffle: bool, num_workers: int = None, mode="train"):
         """根据 patient 掩码构建邻居采样 dataloader。"""
         batch_size = self.batch_size
+        if num_workers is None:
+            num_workers = int(getattr(self.args, "num_workers", 0))
+        if num_workers < 0:
+            num_workers = 0
 
         if self.to_homo:
             dataloader = NeighborLoader(
@@ -716,6 +722,12 @@ class DataModule(LightningDataModule):
             dataloader.input_nodes = ('patient', mask)
 
         dataloader.num_neighbors = [self.num_neigh] * self.n_layer
+        if not hasattr(self, "_loader_info_printed"):
+            print(
+                f"[DataLoader] mode={mode} | batch_size={batch_size} | num_workers={num_workers} | "
+                f"n_layer={self.n_layer} | num_neigh={self.num_neigh}"
+            )
+            self._loader_info_printed = True
         return dataloader
 
     def train_dataloader(self):

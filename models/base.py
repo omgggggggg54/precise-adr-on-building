@@ -433,14 +433,16 @@ class BasicModelWrapper(LightningModule):
 
     def on_train_batch_start(self, batch, batch_idx):
         """每个训练 batch 开始前先尝试清理一下显存碎片。"""
-        torch.cuda.empty_cache()
+        if bool(getattr(self.args, "use_empty_cache_hook", False)):
+            torch.cuda.empty_cache()
         super().on_train_batch_start(batch, batch_idx)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         """每个训练 batch 结束后释放中间对象。"""
         super().on_train_batch_end(outputs, batch, batch_idx)
         del batch, outputs
-        torch.cuda.empty_cache()
+        if bool(getattr(self.args, "use_empty_cache_hook", False)):
+            torch.cuda.empty_cache()
 
     @torch.no_grad()
     def validation_step(self, batch: Batch, batch_idx: int):

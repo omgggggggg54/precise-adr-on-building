@@ -1,12 +1,21 @@
 import numpy as np
 import torch
 from torch.nn import functional as F
-from torchmetrics.retrieval import (
-    retrieval_hit_rate,
-    retrieval_normalized_dcg,
-    retrieval_precision,
-    retrieval_recall,
-)
+# 兼容服务器环境：优先新路径，失败回退旧路径。
+try:
+    from torchmetrics.retrieval import (
+        retrieval_hit_rate,
+        retrieval_normalized_dcg,
+        retrieval_precision,
+        retrieval_recall,
+    )
+except Exception:
+    from torchmetrics.functional import (
+        retrieval_hit_rate,
+        retrieval_normalized_dcg,
+        retrieval_precision,
+        retrieval_recall,
+    )
 '''辅助指标（检索 Hit Rate、NDCG、Precision/Recall）和 Focal Loss。'''
 
 class RetrievalHitRate(object):
