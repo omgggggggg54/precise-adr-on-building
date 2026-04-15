@@ -1,3 +1,7 @@
+# 指定 PyTorch 和 PyG 的 CUDA 11.8 预编译包索引
+--extra-index-url https://download.pytorch.org/whl/cu118
+--find-links https://data.pyg.org/whl/torch-2.4.0+cu118.html
+
 # ===== PreciseADR 必需依赖（主流程 + 数据脚本）=====
 numpy
 pandas
@@ -10,13 +14,18 @@ easydict
 rich
 
 # ===== 训练与图模型 =====
-torch
-torchvision
-torchaudio
+# 锁定版本以确保与底部的 PyG 扩展库完全对齐
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
 pytorch-lightning
 torchmetrics
 torch-geometric
 
-# 如果你使用 GPU + PyG，通常还需要安装对应 CUDA/torch 版本的以下包：
-# pyg-lib, torch-scatter, torch-sparse, torch-cluster, torch-spline-conv
-# 可参考项目 README 中的安装命令。
+# ===== PyG 底层 C++ 扩展 =====
+# 有了顶部的 --find-links，pip 会直接下载对应 torch 2.4.0 + cu118 的编译好的包，不会在本地报错
+pyg-lib
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
