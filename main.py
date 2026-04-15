@@ -108,7 +108,7 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, model_wrappe
     os.makedirs(report_dir, exist_ok=True)
 
     # 先构建数据模块，再根据已经补齐的 args 初始化模型。
-    datamodule = dataset_func(args)
+    datamodule = dataset_func(args)#这里给args赋值了in_dim
     model = model_wrapper(model_name=args.model_name, args=args)
     # 统一按 args.device 判定训练设备，避免 main_eval 漏传参数时走错设备。
     accelerator = "gpu" if ("cuda" in str(args.device).lower() and torch.cuda.is_available()) else "cpu"

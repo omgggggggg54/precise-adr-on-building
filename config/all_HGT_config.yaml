@@ -21,7 +21,7 @@ lr: 0.0005
 max_epochs: 500
 model_name: HGT
 n_data: 0
-n_gnn: 1
+n_gnn: 0
 n_mlp: 3
 num_neigh: 10
 num_train_per_class: 10
@@ -37,10 +37,10 @@ temperature: 0.09
 use_jk: true
 use_scheduler: false
 weight_decay: 5.0e-05
-use_drug_struct: true
+use_drug_struct: false
 drug_encoder_type: hybrid
 drug_struct_dim: 128
 drug_smiles_csv: new_data_in/refined_data/drugbank_id_smiles.csv
 molformer_feat_path: ""
-use_time_feature: true
+use_time_feature: false
 time_dim: 32

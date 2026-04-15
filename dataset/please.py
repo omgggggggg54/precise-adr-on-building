@@ -297,7 +297,9 @@ class PLEASESource(InMemoryDataset):
         self.hetero_graph["indication"].x = torch.arange(num_indication)
         self.hetero_graph["drug"].x = torch.arange(num_drug)
 
-        # indication 的 one-hot 区间从个人信息之后开始。
+        # indication 的 one-hot 区间从个人信息之后开始。 
+        # #one_hot(..., num_classes=self.in_dim) 将每个全局唯一索引转换为一个长度为 self.in_dim 的独热向量。
+        #[],[],[]...num_indication个(in_dim维)one_hot向量
         self.hetero_graph["indication"].bow_feat = one_hot(
             torch.arange(num_indication) + self.info_mapping.num_elements,
             num_classes=self.in_dim
