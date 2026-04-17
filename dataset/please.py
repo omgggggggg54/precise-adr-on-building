@@ -693,6 +693,9 @@ class DataModule(LightningDataModule):
     def dataloader(self, mask: Tensor, shuffle: bool, num_workers: int = None, mode="train"):
         """根据 patient 掩码构建邻居采样 dataloader。"""
         batch_size = self.batch_size
+        # 每次构建 Loader 都复制一份 mask，避免底层共享张量在评估阶段被原地修改。
+        # 这能减少 PyG 邻居采样与 inference tensor 相关的冲突风险。
+        mask = mask.clone()
         if num_workers is None:
             num_workers = int(getattr(self.args, "num_workers", 0))
         if num_workers < 0:

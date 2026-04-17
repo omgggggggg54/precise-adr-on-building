@@ -144,6 +144,10 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, model_wrappe
         check_val_every_n_epoch=args.eval_step,
         log_every_n_steps=1,
         enable_progress_bar=True,
+        # 关键：关闭 inference_mode，避免 PyG 邻居采样在评估阶段触发
+        # “Inplace update to inference tensor outside InferenceMode” 崩溃。
+        # 评估仍然是无梯度执行（no_grad），只是不用 inference tensor。
+        inference_mode=False,
         callbacks=callbacks,
         num_sanity_val_steps=0,
         # logger=False
@@ -194,13 +198,9 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, model_wrappe
         f.write(f"test_metrics: {test_score}\n")
         f.write("\n")
         f.write("params:\n")
-        for k in [
-            "batch_size", "n_gnn", "n_mlp", "max_epochs", "eval_step", "split",
-            "n_data", "num_neigh", "lr", "weight_decay", "dropout", "add_SE", "device",
-            "use_drug_struct", "drug_encoder_type", "drug_struct_dim", "drug_smiles_csv",
-            "molformer_feat_path", "use_time_feature", "time_dim"
-        ]:
-            f.write(f"{k}: {getattr(args, k, None)}\n")
+        # 这里写入的是 parse_args_and_yaml() 后的最终 args（yaml 默认值 + 命令行覆盖）。
+        for k, v in sorted(vars(args).items()):
+            f.write(f"{k}: {v}\n")
     # 统一维护一个总索引表，后续找最优权重/指标时不用翻目录。
     run_index_path = os.path.join("outputs", "run_index.csv")
     os.makedirs(os.path.dirname(run_index_path), exist_ok=True)
@@ -237,6 +237,8 @@ def main_predict(args, dataset_func=build_dataset_func, model_wrapper=BasicModel
         devices=1,
         max_epochs=args.max_epochs,
         check_val_every_n_epoch=args.eval_step,
+        # 与训练主流程保持一致，规避 PyG 采样与 inference tensor 冲突。
+        inference_mode=False,
         num_sanity_val_steps=0,
     )
 
@@ -301,10 +303,5 @@ if __name__ == "__main__":
             f.write(f"res_dict: {res_dict}\n")
             f.write("\n")
             f.write("params:\n")
-            for k in [
-                "seed", "batch_size", "n_gnn", "n_mlp", "max_epochs", "eval_step", "split",
-                "n_data", "num_neigh", "lr", "weight_decay", "dropout", "add_SE", "device",
-                "use_drug_struct", "drug_encoder_type", "drug_struct_dim", "drug_smiles_csv",
-                "molformer_feat_path", "use_time_feature", "time_dim"
-            ]:
-                f.write(f"{k}: {getattr(args, k, None)}\n")
+            for k, v in sorted(vars(args).items()):
+                f.write(f"{k}: {v}\n")

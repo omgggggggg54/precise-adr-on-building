@@ -8,10 +8,30 @@ import pandas as pd
 
 try:
     from rdkit import Chem
-    from rdkit.Chem import AllChem
+    from rdkit.Chem import AllChem, MACCSkeys, Descriptors, rdMolDescriptors
     HAS_RDKIT = True
 except Exception:
     HAS_RDKIT = False
+
+# Morgan 指纹固定位数，2048 位减少哈希碰撞，再投影到 dim
+_FP_NBITS = 2048
+
+# 物化描述符 clip 先验范围 (lo, hi)，顺序与 encode_physchem 保持一致
+_PHYSCHEM_CLIPS = [
+    (0.0, 1500.0),   # MolWt
+    (-5.0, 10.0),    # MolLogP
+    (0.0, 300.0),    # TPSA
+    (0.0, 20.0),     # NumHDonors
+    (0.0, 20.0),     # NumHAcceptors
+    (0.0, 30.0),     # NumRotatableBonds
+    (0.0, 10.0),     # NumAromaticRings
+    (0.0, 15.0),     # RingCount
+    (0.0, 1.0),      # FractionCSP3
+    (0.0, 100.0),    # NumHeavyAtoms
+    (0.0, 30.0),     # NumHeteroatoms
+    (-1.0, 1.0),     # MaxPartialCharge
+    (-1.0, 1.0),     # MinPartialCharge
+]
 
 
 def _stable_hash(token: str) -> int:
@@ -102,10 +122,11 @@ def encode_fingerprint(smiles: str, dim: int) -> np.ndarray:
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return vec
-        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=dim)
-        arr = np.zeros((dim,), dtype=np.float32)
+        # 固定 2048 位再投影，减少哈希碰撞
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=_FP_NBITS)
+        arr = np.zeros((_FP_NBITS,), dtype=np.float32)
         Chem.DataStructs.ConvertToNumpyArray(fp, arr)
-        return arr.astype(np.float32)
+        return _l2_normalize(_fit_dim(arr, dim))
 
     # 无 RDKit 时，用字符 n-gram 哈希近似。
     chars = list(smiles)
@@ -125,6 +146,57 @@ def _fit_dim(vec: np.ndarray, target_dim: int) -> np.ndarray:
     out = np.zeros(target_dim, dtype=np.float32)
     out[:vec.shape[0]] = vec
     return out
+
+
+def encode_physchem(smiles: str, dim: int) -> np.ndarray:
+    """物化描述符 + MACCS Keys 编码。
+
+    13 个标量描述符经 clip+min-max 归一化后与 MACCS 167 位拼接（共 180 维），
+    再用 _fit_dim 截断/补零到 dim，最后 L2 归一化。
+    无 RDKit 时返回全零向量。
+    """
+    vec = np.zeros(dim, dtype=np.float32)
+    if not smiles or not HAS_RDKIT:
+        return vec
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return vec
+
+    # 计算 Gasteiger 电荷（MaxPartialCharge/MinPartialCharge 依赖此步骤）
+    AllChem.ComputeGasteigerCharges(mol)
+
+    # 13 个标量描述符（顺序与 _PHYSCHEM_CLIPS 对应）
+    raw_scalars = [
+        Descriptors.MolWt(mol),
+        Descriptors.MolLogP(mol),
+        Descriptors.TPSA(mol),
+        rdMolDescriptors.CalcNumHBD(mol),
+        rdMolDescriptors.CalcNumHBA(mol),
+        rdMolDescriptors.CalcNumRotatableBonds(mol),
+        rdMolDescriptors.CalcNumAromaticRings(mol),
+        rdMolDescriptors.CalcNumRings(mol),
+        rdMolDescriptors.CalcFractionCSP3(mol),
+        float(mol.GetNumHeavyAtoms()),
+        float(rdMolDescriptors.CalcNumHeteroatoms(mol)),
+        Descriptors.MaxPartialCharge(mol),
+        Descriptors.MinPartialCharge(mol),
+    ]
+
+    # clip + min-max 归一化到 [0, 1]，NaN 补 0
+    scalars = np.array(raw_scalars, dtype=np.float64)
+    scalars = np.nan_to_num(scalars, nan=0.0)
+    for j, (lo, hi) in enumerate(_PHYSCHEM_CLIPS):
+        scalars[j] = (np.clip(scalars[j], lo, hi) - lo) / (hi - lo + 1e-12)
+
+    # MACCS Keys 167 位（二值，直接转 float）
+    maccs = np.zeros(167, dtype=np.float32)
+    maccs_fp = MACCSkeys.GenMACCSKeys(mol)
+    Chem.DataStructs.ConvertToNumpyArray(maccs_fp, maccs)
+
+    # 拼接后投影到 dim
+    combined = np.concatenate([scalars.astype(np.float32), maccs])
+    return _l2_normalize(_fit_dim(combined, dim))
 
 
 def load_smiles_map(smiles_csv_path: str) -> Dict[str, str]:
@@ -200,18 +272,25 @@ def encode_smiles(smiles: str, dim: int, encoder_type: str, molformer_vec: np.nd
     if mode == "fingerprint":
         return encode_fingerprint(smiles, dim)
 
+    if mode == "physchem":
+        return encode_physchem(smiles, dim)
+
     if mode == "molformer":
         if molformer_vec is not None and molformer_vec.size > 0:
             return _l2_normalize(_fit_dim(molformer_vec, dim))
         # 没有 MolFormer 向量时回退到 hybrid，避免整列全零。
         atom_vec = encode_atom_bond(smiles, dim)
         fp_vec = encode_fingerprint(smiles, dim)
-        return _l2_normalize(0.5 * atom_vec + 0.5 * fp_vec).astype(np.float32)
+        pc_vec = encode_physchem(smiles, dim)
+        w = 1.0 / 3.0
+        return _l2_normalize(w * atom_vec + w * fp_vec + w * pc_vec).astype(np.float32)
 
-    # hybrid: 原子键聚合 + 分子指纹融合。
+    # hybrid: 原子键聚合 + 分子指纹 + 物化描述符三路均分融合。
     atom_vec = encode_atom_bond(smiles, dim)
     fp_vec = encode_fingerprint(smiles, dim)
-    return _l2_normalize(0.5 * atom_vec + 0.5 * fp_vec).astype(np.float32)
+    pc_vec = encode_physchem(smiles, dim)
+    w = 1.0 / 3.0
+    return _l2_normalize(w * atom_vec + w * fp_vec + w * pc_vec).astype(np.float32)
 
 
 def build_drug_struct_matrix(

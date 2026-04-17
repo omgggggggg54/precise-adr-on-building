@@ -11,7 +11,7 @@ if __name__ == "__main__":
     # 按论文设置，依次评估 all / gender / age 三个数据子集。
     overall_job_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     overall_job_dir = os.path.join("outputs", "eval_jobs", overall_job_id)
-    os.makedirs(overall_job_dir, exist_ok=True)
+    os.makedirs(overall_job_dir, exist_ok=True)#如果目标路径的任何一级父目录不存在，都会自动逐层创建。
     overall_res_dict = {}
 
     for dataset in ["all", "gender", "age"]:
@@ -65,13 +65,11 @@ if __name__ == "__main__":
                     f.write(f"res_dict: {res_dict}\n")
                     f.write("\n")
                     f.write("params:\n")
-                    for k in [
-                        "seed", "batch_size", "n_gnn", "n_mlp", "max_epochs", "eval_step", "split",
-                        "n_data", "num_neigh", "lr", "weight_decay", "dropout", "add_SE", "device",
-                        "use_drug_struct", "drug_encoder_type", "drug_struct_dim", "drug_smiles_csv",
-                        "molformer_feat_path", "use_time_feature", "time_dim"
-                    ]:
-                        f.write(f"{k}: {getattr(args, k, None)}\n")
+                    # 这里必须输出「最终 args」的全部参数：
+                    # args 已经经过 parse_args_and_yaml()（加载 yaml 并被命令行覆盖）得到最终值。
+                    # 统一排序输出，便于不同实验之间做 diff 对比。
+                    for k, v in sorted(vars(args).items()):
+                        f.write(f"{k}: {v}\n")
 
     print("\n===== 全部数据集评估完成 =====")
     print(overall_res_dict)

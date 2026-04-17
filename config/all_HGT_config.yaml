@@ -21,7 +21,7 @@ lr: 0.0005
 max_epochs: 500
 model_name: HGT
 n_data: 0
-n_gnn: 0
+n_gnn: 1
 n_mlp: 3
 num_neigh: 10
 num_train_per_class: 10
