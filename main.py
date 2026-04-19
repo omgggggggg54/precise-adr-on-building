@@ -50,7 +50,7 @@ def build_dataset_func(args):
         raise RuntimeError(f"Don't support Dataset:{args.dataset}")
 
     # setup 会真正构建图、切分掩码，并准备 dataloader 所需的数据对象。
-    datamodule.setup()
+    datamodule.setup()#setup_over为true直接跳过
     data = datamodule.data#图
 
     # 这几个起止位置对应 patient BOW 特征里 indication / drug 特征片段的索引范围。

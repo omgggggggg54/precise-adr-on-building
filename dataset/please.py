@@ -2,7 +2,8 @@ import glob
 import os
 import os.path as osp
 import pickle
-from collections import OrderedDict
+from collections import Counter, OrderedDict
+from itertools import combinations
 from typing import List, Optional
 
 import numpy as np
@@ -131,6 +132,9 @@ class PLEASESource(InMemoryDataset):
         self.drug_struct_dim = int(getattr(self.args, "drug_struct_dim", 128))
         self.drug_smiles_csv = str(getattr(self.args, "drug_smiles_csv", default_smiles_csv))
         self.molformer_feat_path = str(getattr(self.args, "molformer_feat_path", ""))
+        # 药物共现图配置。默认开启，统计范围严格限定在当前数据集文件内部。
+        self.use_drug_cooccur = bool(getattr(self.args, "use_drug_cooccur", True))
+        self.drug_cooccur_min_count = int(getattr(self.args, "drug_cooccur_min_count", 10))
         # 时间特征开关（数据里始终会生成 time_days，模型侧按开关使用）。
         self.use_time_feature = bool(getattr(self.args, "use_time_feature", True))
 
@@ -200,9 +204,13 @@ class PLEASESource(InMemoryDataset):
         属性会在每次实例化 PLEASESource 时被触发"""
         #父类 InMemoryDataset 会根据这个属性自动生成 self.processed_paths
         #self.processed_dir = os.path.join(self.root, 'processed')
+        molformer_tag = "nomf"
+        if self.drug_encoder_type.lower() == "molformer" and self.molformer_feat_path:
+            molformer_tag = osp.splitext(osp.basename(self.molformer_feat_path))[0]
         return (
-            f'PLEASE_{self.se_type}_v3_{self.n_data}_'
-            f'{int(self.use_drug_struct)}_{self.drug_encoder_type}_{self.drug_struct_dim}.pt'
+            f'PLEASE_{self.se_type}_v4_{self.n_data}_'
+            f'{int(self.use_drug_struct)}_{self.drug_encoder_type}_{self.drug_struct_dim}_'
+            f'{molformer_tag}_{int(self.use_drug_cooccur)}_{self.drug_cooccur_min_count}.pt'
         )
 
     @property
@@ -283,7 +291,7 @@ class PLEASESource(InMemoryDataset):
         except Exception:
             return 0
 
-    def build_base_graph(self):
+    def build_base_graph(self, all_pd):
         """构建不依赖 patient 的基础异构图骨架。"""
         num_se = len(self.se_map)
         num_indication = len(self.i_map)
@@ -329,22 +337,88 @@ class PLEASESource(InMemoryDataset):
                 "[DrugStruct] mode:",
                 self.drug_encoder_type,
                 "| dim:",
-                self.drug_struct_dim,
+                self.hetero_graph["drug"].struct_feat.size(1),
                 "| total:",
                 struct_stat["total_drug"],
                 "| smiles_hit:",
                 struct_stat["hit_smiles"],
                 "| molformer_hit:",
                 struct_stat["hit_molformer"],
+                "| molformer_dim:",
+                struct_stat["loaded_molformer_dim"],
+                "| molformer_missing:",
+                len(struct_stat["missing_molformer_ids"]),
                 "| rdkit:",
                 struct_stat["rdkit_enabled"],
             )
+
+        # 显式加入药物-药物共现图，统计范围只看当前数据集文件。
+        self._build_drug_cooccur_edges(all_pd)
 
         # SE 的 one-hot 区间位于统一特征空间的最后一段。
         self.hetero_graph["SE"].bow_feat = one_hot(
             torch.arange(num_se) + self.info_mapping.num_elements + num_indication + num_drug,
             num_classes=self.in_dim
         ).float().to_sparse()
+
+    def _build_drug_cooccur_edges(self, all_pd):
+        """按病例里的 drug 集合统计药物两两共现边。"""
+        if not self.use_drug_cooccur:
+            print("[DrugCooccur] disabled")
+            return
+
+        pair_counter = Counter()
+        total_drug = len(self.d_map)
+        possible_pairs = total_drug * (total_drug - 1) / 2 if total_drug > 1 else 0.0
+
+        for drugs in tqdm(
+            all_pd["drugs"],
+            total=len(all_pd),
+            desc="1.5/3 统计药物共现",
+            dynamic_ncols=True
+        ):
+            unique_drugs = sorted({drug_id for drug_id in drugs if drug_id in self.d_map})
+            if len(unique_drugs) < 2:
+                continue
+
+            for left_id, right_id in combinations(unique_drugs, 2):
+                left_idx = self.d_map[left_id]
+                right_idx = self.d_map[right_id]
+                pair_counter[(left_idx, right_idx)] += 1
+
+        total_pairs_before_threshold = len(pair_counter)
+        kept_pairs = [
+            (left_idx, right_idx, count)
+            for (left_idx, right_idx), count in pair_counter.items()
+            if count >= self.drug_cooccur_min_count
+        ]
+        total_pairs_after_threshold = len(kept_pairs)
+        density_after_threshold = (
+            total_pairs_after_threshold / possible_pairs if possible_pairs > 0 else 0.0
+        )
+
+        if kept_pairs:
+            edge_index = torch.tensor(
+                [[left_idx for left_idx, _, _ in kept_pairs], [right_idx for _, right_idx, _ in kept_pairs]],
+                dtype=torch.long,
+            )
+            cooccur_count = torch.tensor([count for _, _, count in kept_pairs], dtype=torch.long)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            cooccur_count = torch.empty((0,), dtype=torch.long)
+
+        self.hetero_graph["drug", "d_d", "drug"].edge_index = edge_index
+        self.hetero_graph["drug", "d_d", "drug"].cooccur_count = cooccur_count
+        print(
+            "[DrugCooccur] threshold:",
+            self.drug_cooccur_min_count,
+            "| total_pairs_before_threshold:",
+            total_pairs_before_threshold,
+            "| total_pairs_after_threshold:",
+            total_pairs_after_threshold,
+            "| density_after_threshold:",
+            f"{density_after_threshold:.6f}",
+        )
 
     def _load_data(self):
         """读取原始 pickle 数据，并按 receipt_date 升序排序。"""
@@ -379,7 +453,7 @@ class PLEASESource(InMemoryDataset):
         print("data size:", len(all_pd))
 
         self.hetero_graph = HeteroData()
-        self.build_base_graph()
+        self.build_base_graph(all_pd)
         self.extract_patient_graph(all_pd)
 
         # 最终把完整异构图保存到 processed 文件。

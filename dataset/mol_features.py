@@ -1,5 +1,4 @@
 import ast
-import math
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -218,14 +217,18 @@ def load_smiles_map(smiles_csv_path: str) -> Dict[str, str]:
     return {k: v for k, v in zip(df["DrugBank ID"].tolist(), df["SMILES"].tolist())}
 
 
-def _to_numeric_embedding_list(row: pd.Series, id_col: str) -> np.ndarray:
+def _to_numeric_embedding_list(row: pd.Series, id_col: str, feat_cols: List[str]) -> np.ndarray:
     """把一行 MolFormer 记录转成数值向量。"""
+    if feat_cols:
+        vals = pd.to_numeric(row[feat_cols], errors="coerce").to_numpy(dtype=np.float32)
+        return np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0)
+
     if "embedding" in row.index:
         raw = row["embedding"]
         if isinstance(raw, str):
             try:
                 arr = np.array(ast.literal_eval(raw), dtype=np.float32)
-                return arr
+                return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
             except Exception:
                 pass
 
@@ -233,9 +236,29 @@ def _to_numeric_embedding_list(row: pd.Series, id_col: str) -> np.ndarray:
     for col, v in row.items():
         if col == id_col:
             continue
-        if isinstance(v, (int, float, np.integer, np.floating)) and not math.isnan(float(v)):
+        try:
             vals.append(float(v))
-    return np.array(vals, dtype=np.float32)
+        except Exception:
+            continue
+    if not vals:
+        return np.array([], dtype=np.float32)
+    arr = np.array(vals, dtype=np.float32)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _resolve_molformer_feature_cols(df: pd.DataFrame, id_col: str) -> List[str]:
+    """优先识别宽表格式的 mf_* 列。"""
+    mf_cols = [col for col in df.columns if col != id_col and str(col).startswith("mf_")]
+    if mf_cols:
+        return sorted(mf_cols)
+
+    if "embedding" in df.columns:
+        return []
+
+    return [
+        col for col in df.columns
+        if col != id_col and pd.api.types.is_numeric_dtype(df[col])
+    ]
 
 
 def load_molformer_map(molformer_feat_path: str) -> Dict[str, np.ndarray]:
@@ -251,12 +274,13 @@ def load_molformer_map(molformer_feat_path: str) -> Dict[str, np.ndarray]:
         return {}
 
     id_col = "DrugBank ID" if "DrugBank ID" in df.columns else df.columns[0]
+    feat_cols = _resolve_molformer_feature_cols(df, id_col)
     out = {}
     for _, row in df.iterrows():
         drug_id = str(row[id_col]).strip()
         if not drug_id:
             continue
-        vec = _to_numeric_embedding_list(row, id_col)
+        vec = _to_numeric_embedding_list(row, id_col, feat_cols)
         if vec.size > 0:
             out[drug_id] = vec
     return out
@@ -277,7 +301,10 @@ def encode_smiles(smiles: str, dim: int, encoder_type: str, molformer_vec: np.nd
 
     if mode == "molformer":
         if molformer_vec is not None and molformer_vec.size > 0:
-            return _l2_normalize(_fit_dim(molformer_vec, dim))
+            arr = np.nan_to_num(molformer_vec.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            if arr.shape[0] == dim:
+                return _l2_normalize(arr)
+            return _l2_normalize(_fit_dim(arr, dim))
         # 没有 MolFormer 向量时回退到 hybrid，避免整列全零。
         atom_vec = encode_atom_bond(smiles, dim)
         fp_vec = encode_fingerprint(smiles, dim)
@@ -306,11 +333,19 @@ def build_drug_struct_matrix(
         raise ValueError("drug_struct_dim 必须 > 0")
 
     smiles_map = load_smiles_map(smiles_csv_path)
-    molformer_map = load_molformer_map(molformer_feat_path) if encoder_type.lower() == "molformer" else {}
+    use_molformer = encoder_type.lower() == "molformer"
+    molformer_map = load_molformer_map(molformer_feat_path) if use_molformer else {}
+    loaded_molformer_dim = 0
+    if molformer_map:
+        first_vec = next(iter(molformer_map.values()))
+        loaded_molformer_dim = int(first_vec.shape[0])
 
-    mat = np.zeros((len(ordered_drug_ids), struct_dim), dtype=np.float32)
+    # MolFormer 模式优先使用外部文件的真实维度。
+    real_dim = loaded_molformer_dim if loaded_molformer_dim > 0 else struct_dim
+    mat = np.zeros((len(ordered_drug_ids), real_dim), dtype=np.float32)
     hit_smiles = 0
     hit_molformer = 0
+    missing_molformer_ids = []
 
     for i, drug_id in enumerate(ordered_drug_ids):
         smiles = smiles_map.get(drug_id, "")
@@ -319,12 +354,16 @@ def build_drug_struct_matrix(
         molformer_vec = molformer_map.get(drug_id)
         if molformer_vec is not None and molformer_vec.size > 0:
             hit_molformer += 1
-        mat[i] = encode_smiles(smiles, struct_dim, encoder_type, molformer_vec=molformer_vec)
+        elif use_molformer and loaded_molformer_dim > 0:
+            missing_molformer_ids.append(drug_id)
+        mat[i] = encode_smiles(smiles, real_dim, encoder_type, molformer_vec=molformer_vec)
 
     stat = {
         "total_drug": len(ordered_drug_ids),
         "hit_smiles": hit_smiles,
         "hit_molformer": hit_molformer,
         "rdkit_enabled": int(HAS_RDKIT),
+        "loaded_molformer_dim": loaded_molformer_dim,
+        "missing_molformer_ids": missing_molformer_ids,
     }
     return mat, stat

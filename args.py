@@ -52,10 +52,13 @@ def register_args(parser, config_file="config/all_HGT_config.yaml"):
     parser.add_argument("--se_min_count", type=int, default=100)
     # 药物结构编码配置。
     parser.add_argument("--use_drug_struct", type=bool, default=True)
-    parser.add_argument("--drug_encoder_type", type=str, default="hybrid")
+    parser.add_argument("--drug_encoder_type", type=str, default="molformer")
     parser.add_argument("--drug_struct_dim", type=int, default=128)
     parser.add_argument("--drug_smiles_csv", type=str, default="new_data_in/refined_data/drugbank_id_smiles.csv")
-    parser.add_argument("--molformer_feat_path", type=str, default="")
+    parser.add_argument("--molformer_feat_path", type=str, default="new_data_in/refined_data/drugbank_molformer_features.csv")
+    # 药物共现图配置。
+    parser.add_argument("--use_drug_cooccur", type=bool, default=True)
+    parser.add_argument("--drug_cooccur_min_count", type=int, default=10)
     # 时序建模配置。
     parser.add_argument("--use_time_feature", type=bool, default=True)
     parser.add_argument("--time_dim", type=int, default=32)

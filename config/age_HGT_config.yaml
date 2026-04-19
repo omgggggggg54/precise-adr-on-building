@@ -36,10 +36,12 @@ temperature: 0.07
 use_jk: true
 use_scheduler: false
 weight_decay: 5.0e-05
-use_drug_struct: false
-drug_encoder_type: hybrid
+use_drug_struct: true
+drug_encoder_type: molformer
 drug_struct_dim: 128
 drug_smiles_csv: new_data_in/refined_data/drugbank_id_smiles.csv
-molformer_feat_path: ""
+molformer_feat_path: new_data_in/refined_data/drugbank_molformer_features.csv
+use_drug_cooccur: true
+drug_cooccur_min_count: 10
 use_time_feature: false
 time_dim: 32
