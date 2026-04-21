@@ -388,6 +388,12 @@ class BasicModelWrapper(LightningModule):
         self.test_y_hat = []
         self.test_ids = []
 
+    @staticmethod
+    def _clear_cuda_cache():
+        """统一封装显存缓存清理，避免在 CPU 环境下多余调用。"""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def forward(#占位或备用接口
             self,
             x_dict: Dict[NodeType, Tensor],
@@ -509,17 +515,21 @@ class BasicModelWrapper(LightningModule):
         """训练 epoch 结束后的清理。"""
         self.train_y.clear(), self.train_y_hat.clear(), self.train_ids.clear()
         super().on_train_epoch_end()
-        torch.cuda.empty_cache()
+        self._clear_cuda_cache()
 
     def on_validation_epoch_end(self):
         """验证 epoch 结束后统一计算验证指标。"""
         self.evaluate_metrics(self.val_y, self.val_y_hat, self.val_ids)
         super().on_validation_epoch_end()
+        # 验证通常发生在 epoch 末尾，这里主动释放缓存，减轻显存峰值残留。
+        self._clear_cuda_cache()
 
     def on_test_epoch_end(self):
         """测试 epoch 结束后输出完整指标集。"""
         self.evaluate_metrics(self.test_y, self.test_y_hat, self.test_ids, mod="test", full=True)
         super().on_test_epoch_end()
+        # 测试阶段同样会临时拉高显存占用，结束后立刻清缓存。
+        self._clear_cuda_cache()
 
     @torch.no_grad()
     def test_step(self, batch: Batch, batch_idx: int):

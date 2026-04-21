@@ -553,7 +553,8 @@ class PLEASESource(InMemoryDataset):
 
 
 class DataModule(LightningDataModule):
-    """Lightning 数据模块，负责数据准备、切分和邻居采样。"""
+    """Lightning 数据模块，负责数据准备、切分和邻居采样。
+        初始化的时候就setup,调用transform(dataset[0]操作时会触发setup,setup_over=True,后续就不会重复setup了)"""
 
     def __init__(
             self,
@@ -765,7 +766,8 @@ class DataModule(LightningDataModule):
             self.setup_over = True
 
     def dataloader(self, mask: Tensor, shuffle: bool, num_workers: int = None, mode="train"):
-        """根据 patient 掩码构建邻居采样 dataloader。"""
+        """根据 patient 掩码构建邻居采样 dataloader。
+           被 train_dataloader、val_dataloader 和 test_dataloader 调用。"""
         batch_size = self.batch_size
         # 每次构建 Loader 都复制一份 mask，避免底层共享张量在评估阶段被原地修改。
         # 这能减少 PyG 邻居采样与 inference tensor 相关的冲突风险。

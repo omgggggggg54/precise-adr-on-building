@@ -287,7 +287,15 @@ def load_molformer_map(molformer_feat_path: str) -> Dict[str, np.ndarray]:
 
 
 def encode_smiles(smiles: str, dim: int, encoder_type: str, molformer_vec: np.ndarray = None) -> np.ndarray:
-    """统一编码入口。"""
+    """统一编码入口。
+       1. atom_bond: 原子键聚合编码。
+       2. fingerprint: 分子指纹编码。
+       3. physchem: 物化描述符编码。
+       4. molformer: MolFormer 预训练向量编码。
+          - 优先使用外部文件提供的真实维度向量，缺失时回退到 hybrid。
+          - 没有 MolFormer 向量时回退到 hybrid，避免整列全零。
+       5. hybrid: 原子键聚合 + 分子指纹 + 物化描述符三路均分融合。
+    """
     mode = (encoder_type or "hybrid").lower()
 
     if mode == "atom_bond":

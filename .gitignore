@@ -17,7 +17,10 @@ association_mining/
 new_data_in/
 LICENSE
 __pycache__/
+processed/
+outputs/
 pretrained/
+lightning_logs/
 # 取反规则（必须写完整路径）
 !所作所为.md
 !new_data_in/refined_data/drugbank_id_smiles.csv
