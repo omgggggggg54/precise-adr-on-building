@@ -36,3 +36,6 @@ use_drug_cooccur: false
 drug_cooccur_min_count: 10
 use_time_feature: false
 time_dim: 32
+use_label_gnn: true
+label_gnn_topk: 20
+label_gnn_metric: jaccard

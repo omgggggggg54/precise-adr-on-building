@@ -11,6 +11,31 @@ from .base import BasicModelWrapper, Time2Vec
 from .info_nce import info_nce
 '''扩展模型，增加对比学习分支（InfoNCE）和对应的 Lightning 包装器（ContrastiveWrapper'''
 
+
+class LabelGraphLayer(nn.Module):
+    """在输出层按标签关系图对 logits 做一次轻量传播。"""
+
+    def __init__(self):
+        super().__init__()
+        # gate 从 0 开始，初始阶段严格等价原模型。
+        self.gate = nn.Parameter(torch.zeros(1))
+        self.register_buffer("label_adj", torch.empty(0, 0))
+
+    def set_label_adj(self, label_adj: Tensor):
+        """注入数据侧预计算好的标签邻接矩阵。"""
+        if label_adj is None:
+            self.label_adj = torch.empty(0, 0)
+        else:
+            self.label_adj = label_adj.float().detach().clone()
+
+    def forward(self, logits: Tensor) -> Tensor:
+        """按标签图传播一次，并以残差形式叠加回原始 logits。"""
+        if self.label_adj.numel() == 0:
+            return logits
+
+        logits_gnn = torch.matmul(logits, self.label_adj)
+        return logits + torch.tanh(self.gate) * logits_gnn
+
 class PreciseADR_RGCN(nn.Module):
     """带对比学习分支的异构图模型，基础卷积算子使用 GraphSAGE。"""
 
@@ -34,6 +59,7 @@ class PreciseADR_RGCN(nn.Module):
         self.time_dim = int(getattr(args, "time_dim", 32))
         self.use_drug_struct = bool(getattr(args, "use_drug_struct", True)) and int(getattr(args, "drug_struct_dim", 0)) > 0
         self.drug_struct_dim = int(getattr(args, "drug_struct_dim", 0))
+        self.use_label_gnn = bool(getattr(args, "use_label_gnn", True))
 
         # in_lin 把统一 BOW 输入先映射到隐藏空间，供大多数节点类型共享。
         nn_layers = []
@@ -46,6 +72,8 @@ class PreciseADR_RGCN(nn.Module):
 
         # readout 负责把 patient 隐层表示映射成多标签分类 logits。
         self.readout = nn.Linear(self.hid_dim, self.out_dim)
+        # 标签图后处理放在 readout 之后，只做最轻的一次传播。
+        self.label_graph = LabelGraphLayer()
 
         # SE 节点单独走一套投影层，避免与其它节点完全共享参数。
         ae_layers = []
@@ -91,6 +119,13 @@ class PreciseADR_RGCN(nn.Module):
             )
         else:
             self.drug_struct_proj = None
+
+    def set_label_graph(self, label_adj: Tensor):
+        """把训练集统计得到的标签邻接矩阵挂到模型里。"""
+        if self.use_label_gnn:
+            self.label_graph.set_label_adj(label_adj)
+        else:
+            self.label_graph.set_label_adj(None)
 
     def build_aug(self, x):
         """在输入特征上随机补 1，生成对比学习使用的增强视图。"""
@@ -174,7 +209,8 @@ class PreciseADR_RGCN(nn.Module):
             x_dict = next_x_dict
 
         hidden = x_dict["patient"][:batch_size]
-        x = self.readout(hidden + hid_assis)
+        logits_raw = self.readout(hidden + hid_assis)
+        x = self.label_graph(logits_raw) if self.use_label_gnn else logits_raw
 
         if return_hidden:
             return x, hidden, hid_assis, hid_aug
@@ -243,7 +279,8 @@ class PreciseADR_HGT(PreciseADR_RGCN):
             x_dict = next_x_dict
 
         hidden = x_dict["patient"][:batch_size]
-        x = self.readout(hidden + hid_assis)
+        logits_raw = self.readout(hidden + hid_assis)
+        x = self.label_graph(logits_raw) if self.use_label_gnn else logits_raw
 
         if return_hidden:
             return x, hidden, hid_assis, hid_aug#原始BOW特征的投影hid_assis|增强视图的投影hid_aug

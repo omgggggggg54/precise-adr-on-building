@@ -110,6 +110,9 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, model_wrappe
     # 先构建数据模块，再根据已经补齐的 args 初始化模型。
     datamodule = dataset_func(args)#这里给args赋值了in_dim
     model = model_wrapper(model_name=args.model_name, args=args)
+    # 标签关系图在数据切分完成后生成，这里再显式注入到模型。
+    if hasattr(datamodule, "label_adj") and hasattr(model, "model") and hasattr(model.model, "set_label_graph"):
+        model.model.set_label_graph(datamodule.label_adj)
     # 统一按 args.device 判定训练设备，避免 main_eval 漏传参数时走错设备。
     accelerator = "gpu" if ("cuda" in str(args.device).lower() and torch.cuda.is_available()) else "cpu"
     devices = 1

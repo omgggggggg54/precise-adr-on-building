@@ -3,7 +3,7 @@ import yaml
 
 def register_args(parser, config_file="config/all_HGT_config.yaml"):
     # GNN related
-    parser.add_argument("--model_name", type=str, default="AEHAG")
+    parser.add_argument("--model_name", type=str, default="PreciseADR_HGT")
     parser.add_argument("--add_SE",  default=False, action="store_true")
     parser.add_argument("--batch_size", type=int, default=10240)
     parser.add_argument("--hid_dim", type=int, default=64)
@@ -62,6 +62,10 @@ def register_args(parser, config_file="config/all_HGT_config.yaml"):
     # 时序建模配置。
     parser.add_argument("--use_time_feature", type=bool, default=True)
     parser.add_argument("--time_dim", type=int, default=32)
+    # 输出层标签关系图配置。
+    parser.add_argument("--use_label_gnn", type=bool, default=True)
+    parser.add_argument("--label_gnn_topk", type=int, default=20)
+    parser.add_argument("--label_gnn_metric", type=str, default="jaccard")
     parser.add_argument("--config", type=str, default=config_file)
 
 

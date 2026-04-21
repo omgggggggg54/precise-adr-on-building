@@ -595,6 +595,8 @@ class DataModule(LightningDataModule):
         self.split = split
         self.num_train_per_class = self.args.num_train_per_class if hasattr(self.args, "num_train_per_class") else 10
         self.seed = self.args.seed if hasattr(self.args, "seed") else 123
+        # 标签关系图在切分完成后再按训练集即时统计，不写入 processed 缓存。
+        self.label_adj = None
 
         # 初始化阶段就加载一次，保证外部立刻能读到 data 和索引边界。
         self.load()
@@ -762,12 +764,64 @@ class DataModule(LightningDataModule):
                 self.metadata = self.data.metadata()
                 print("node_types:", self.metadata[0])
                 print("edge_types:", self.metadata[1])
+            # 标签关系图必须严格基于 train_mask 统计，不能在 processed 阶段提前固化。
+            self.label_adj = self.build_label_adj()
             print("Validation:", self.data.validate())
             self.setup_over = True
 
+    def build_label_adj(self):
+        """按训练集标签统计 SE-SE Jaccard 邻接矩阵。"""
+        if not bool(getattr(self.args, "use_label_gnn", True)):
+            print("[LabelGNN] disabled")
+            return None
+
+        metric = str(getattr(self.args, "label_gnn_metric", "jaccard")).lower()
+        topk = int(getattr(self.args, "label_gnn_topk", 20))
+        if metric != "jaccard":
+            raise RuntimeError(f"当前只支持 jaccard，收到: {metric}")
+
+        train_mask = self.data["patient"].train_mask
+        train_y = self.data["patient"].y[train_mask].float()
+        num_se = train_y.size(1)
+
+        if train_y.size(0) == 0:
+            print("[LabelGNN] train set is empty, fallback to zero adjacency")
+            return torch.zeros((num_se, num_se), dtype=torch.float32)
+
+        # 共现矩阵的每个元素表示两个标签在训练集中共同出现的次数。
+        cooccur = torch.matmul(train_y.t(), train_y)
+        freq = torch.diag(cooccur)
+        union = freq.unsqueeze(1) + freq.unsqueeze(0) - cooccur
+
+        # 只做最基础的 Jaccard 归一化，避免额外复杂策略。
+        label_adj = torch.where(
+            union > 0,
+            cooccur / union,
+            torch.zeros_like(cooccur)
+        )
+
+        # 不保留自环，只保留标签之间的依赖关系。
+        label_adj.fill_diagonal_(0)
+
+        if 0 < topk < num_se:
+            topk_value, topk_index = torch.topk(label_adj, k=topk, dim=1)
+            sparse_adj = torch.zeros_like(label_adj)
+            sparse_adj.scatter_(1, topk_index, topk_value)
+            label_adj = sparse_adj
+
+        label_adj = label_adj.float().contiguous()
+        nnz = int((label_adj > 0).sum().item())
+        density = nnz / float(num_se * num_se) if num_se > 0 else 0.0
+        print(
+            f"[LabelGNN] metric={metric} | topk={topk} | num_se={num_se} | "
+            f"train_size={int(train_mask.sum().item())} | nnz={nnz} | density={density:.6f}"
+        )
+        return label_adj
+
     def dataloader(self, mask: Tensor, shuffle: bool, num_workers: int = None, mode="train"):
         """根据 patient 掩码构建邻居采样 dataloader。
-           被 train_dataloader、val_dataloader 和 test_dataloader 调用。"""
+           被 train_dataloader、val_dataloader 和 test_dataloader 调用。
+           PyG 的 NeighborLoader 在构建子图时，会把采样的节点重新编号为 0, 1, 2, ...，而不是保留原始的全局 ID。"""
         batch_size = self.batch_size
         # 每次构建 Loader 都复制一份 mask，避免底层共享张量在评估阶段被原地修改。
         # 这能减少 PyG 邻居采样与 inference tensor 相关的冲突风险。

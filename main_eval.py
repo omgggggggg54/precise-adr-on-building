@@ -24,7 +24,6 @@ if __name__ == "__main__":
         register_args(parser, config_file=f"config/{dataset}_HGT_config.yaml")#注册参数（定义格子）register_args 直接修改 parser 对象
         args = parse_args_and_yaml(parser)
         seed = args.seed
-        model_name = args.model_name
 
         if "cuda" in args.device:
             args.device = args.device if torch.cuda.is_available() else "cpu"
@@ -34,7 +33,6 @@ if __name__ == "__main__":
         os.makedirs(job_dir, exist_ok=True)
         try:
             for i in range(1):
-                args.model_name = model_name
                 args.seed = seed + i
                 print(f"[{dataset}] run-{i} 开始 | model={args.model_name} | seed={args.seed}")
 
