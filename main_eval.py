@@ -59,7 +59,7 @@ if __name__ == "__main__":
             with open(summary_path, "w", encoding="utf-8") as f:
                 f.write(f"job_id: {overall_job_id}\n")
                 f.write(f"dataset: {dataset}\n")
-                f.write(f"model_name: {model_name}\n")
+                f.write(f"model_name: {args.model_name}\n")
                 f.write(f"result_path: {result_path}\n")
                 f.write(f"res_dict: {res_dict}\n")
                 f.write("\n")

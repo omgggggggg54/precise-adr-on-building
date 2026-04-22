@@ -66,6 +66,9 @@ def register_args(parser, config_file="config/all_HGT_config.yaml"):
     parser.add_argument("--use_label_gnn", type=bool, default=True)
     parser.add_argument("--label_gnn_topk", type=int, default=20)
     parser.add_argument("--label_gnn_metric", type=str, default="jaccard")
+    # patient 侧药物结构聚合配置。
+    parser.add_argument("--use_patient_drug_agg", type=bool, default=True)
+    parser.add_argument("--patient_drug_agg_type", type=str, default="mean")
     parser.add_argument("--config", type=str, default=config_file)
 
 

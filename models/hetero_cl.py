@@ -59,6 +59,8 @@ class PreciseADR_RGCN(nn.Module):
         self.time_dim = int(getattr(args, "time_dim", 32))
         self.use_drug_struct = bool(getattr(args, "use_drug_struct", True)) and int(getattr(args, "drug_struct_dim", 0)) > 0
         self.drug_struct_dim = int(getattr(args, "drug_struct_dim", 0))
+        self.use_patient_drug_agg = bool(getattr(args, "use_patient_drug_agg", True)) and self.use_drug_struct
+        self.patient_drug_agg_type = str(getattr(args, "patient_drug_agg_type", "mean")).lower()
         self.use_label_gnn = bool(getattr(args, "use_label_gnn", True))
 
         # in_lin 把统一 BOW 输入先映射到隐藏空间，供大多数节点类型共享。
@@ -117,8 +119,18 @@ class PreciseADR_RGCN(nn.Module):
                 nn.Tanh(),
                 nn.Dropout(args.dropout),
             )
+            # 把 patient 聚合后的药物结构向量映射到隐藏空间，直接叠加到主干输出前。
+            self.drug_agg_proj = nn.Sequential(
+                nn.Linear(self.drug_struct_dim, self.hid_dim),
+                nn.Tanh(),
+                nn.Dropout(args.dropout),
+            )
+            # gate 从 0 开始，保证初始阶段与旧模型等价。
+            self.drug_agg_gate = nn.Parameter(torch.zeros(1))
         else:
             self.drug_struct_proj = None
+            self.drug_agg_proj = None
+            self.drug_agg_gate = None
 
     def set_label_graph(self, label_adj: Tensor):
         """把训练集统计得到的标签邻接矩阵挂到模型里。"""
@@ -126,6 +138,21 @@ class PreciseADR_RGCN(nn.Module):
             self.label_graph.set_label_adj(label_adj)
         else:
             self.label_graph.set_label_adj(None)
+
+    def _build_patient_drug_residual(self, patient_drug_struct_agg, batch_size):
+        """把 patient 侧药物结构聚合向量变成隐藏空间残差。"""
+        if not self.use_patient_drug_agg:
+            return None
+        if self.patient_drug_agg_type != "mean":
+            raise RuntimeError(f"当前只支持 mean 聚合，收到: {self.patient_drug_agg_type}")
+        if self.drug_agg_proj is None or patient_drug_struct_agg is None:
+            return None
+
+        patient_drug_struct_agg = patient_drug_struct_agg[:batch_size].float()
+        drug_emb = self.drug_agg_proj(patient_drug_struct_agg)
+        # 用中心化门控，保证参数初始为 0 时残差也严格为 0。
+        gate = 2 * torch.sigmoid(self.drug_agg_gate) - 1
+        return gate * drug_emb
 
     def build_aug(self, x):
         """在输入特征上随机补 1，生成对比学习使用的增强视图。"""
@@ -163,6 +190,7 @@ class PreciseADR_RGCN(nn.Module):
         edge_index_dict = dict(edge_index_dict)
         patient_time = x_dict.pop("patient_time", None)
         drug_struct_feat = x_dict.pop("drug_struct_feat", None)
+        patient_drug_struct_agg = x_dict.pop("patient_drug_struct_agg", None)
 
         if "info_nodes" in x_dict:
             x_dict.pop("info_nodes")
@@ -209,7 +237,11 @@ class PreciseADR_RGCN(nn.Module):
             x_dict = next_x_dict
 
         hidden = x_dict["patient"][:batch_size]
-        logits_raw = self.readout(hidden + hid_assis)
+        patient_drug_residual = self._build_patient_drug_residual(patient_drug_struct_agg, batch_size)
+        fused_hidden = hidden + hid_assis
+        if patient_drug_residual is not None:
+            fused_hidden = fused_hidden + patient_drug_residual
+        logits_raw = self.readout(fused_hidden)
         x = self.label_graph(logits_raw) if self.use_label_gnn else logits_raw
 
         if return_hidden:
@@ -237,6 +269,7 @@ class PreciseADR_HGT(PreciseADR_RGCN):
         edge_index_dict = dict(edge_index_dict)
         patient_time = x_dict.pop("patient_time", None)
         drug_struct_feat = x_dict.pop("drug_struct_feat", None)
+        patient_drug_struct_agg = x_dict.pop("patient_drug_struct_agg", None)
 
         if "info_nodes" in x_dict:
             x_dict.pop("info_nodes")
@@ -279,7 +312,11 @@ class PreciseADR_HGT(PreciseADR_RGCN):
             x_dict = next_x_dict
 
         hidden = x_dict["patient"][:batch_size]
-        logits_raw = self.readout(hidden + hid_assis)
+        patient_drug_residual = self._build_patient_drug_residual(patient_drug_struct_agg, batch_size)
+        fused_hidden = hidden + hid_assis
+        if patient_drug_residual is not None:
+            fused_hidden = fused_hidden + patient_drug_residual
+        logits_raw = self.readout(fused_hidden)
         x = self.label_graph(logits_raw) if self.use_label_gnn else logits_raw
 
         if return_hidden:
@@ -330,6 +367,8 @@ class ContrastiveWrapper(BasicModelWrapper):
             x_dict[n_type] = batch[n_type].bow_feat
         if "time_days" in batch["patient"]:
             x_dict["patient_time"] = batch["patient"].time_days
+        if "drug_struct_agg" in batch["patient"]:
+            x_dict["patient_drug_struct_agg"] = batch["patient"].drug_struct_agg
         if "drug" in batch.node_types and "struct_feat" in batch["drug"]:
             x_dict["drug_struct_feat"] = batch["drug"].struct_feat
 

@@ -136,6 +136,8 @@ class PreciseADR_RGCN(nn.Module):
         self.time_dim = int(getattr(args, "time_dim", 32))
         self.use_drug_struct = bool(getattr(args, "use_drug_struct", True)) and int(getattr(args, "drug_struct_dim", 0)) > 0
         self.drug_struct_dim = int(getattr(args, "drug_struct_dim", 0))
+        self.use_patient_drug_agg = bool(getattr(args, "use_patient_drug_agg", True)) and self.use_drug_struct
+        self.patient_drug_agg_type = str(getattr(args, "patient_drug_agg_type", "mean")).lower()
 
         # 先把统一 BOW 特征投影到隐藏空间。
         nn_layers = []
@@ -173,8 +175,18 @@ class PreciseADR_RGCN(nn.Module):
                 nn.Tanh(),
                 nn.Dropout(args.dropout),
             )
+            # 把 patient 聚合后的药物结构向量投影到隐藏空间，作为输出前的残差项。
+            self.drug_agg_proj = nn.Sequential(
+                nn.Linear(self.drug_struct_dim, self.hid_dim),
+                nn.Tanh(),
+                nn.Dropout(args.dropout),
+            )
+            # gate 从 0 开始，保证初始阶段不改变原模型行为。
+            self.drug_agg_gate = nn.Parameter(torch.zeros(1))
         else:
             self.drug_struct_proj = None
+            self.drug_agg_proj = None
+            self.drug_agg_gate = None
 
     def _build_x_feat(self, x):
         """把原始输入特征投影到模型隐藏空间。"""
@@ -193,10 +205,28 @@ class PreciseADR_RGCN(nn.Module):
 
         return x_dict
 
+    def _build_patient_drug_residual(self, patient_drug_struct_agg, batch_size=None):
+        """把 patient 侧聚合结构向量映射成隐藏空间残差。"""
+        if not self.use_patient_drug_agg:
+            return None
+        if self.patient_drug_agg_type != "mean":
+            raise RuntimeError(f"当前只支持 mean 聚合，收到: {self.patient_drug_agg_type}")
+        if self.drug_agg_proj is None or patient_drug_struct_agg is None:
+            return None
+
+        if batch_size is not None and batch_size >= 0:
+            patient_drug_struct_agg = patient_drug_struct_agg[:batch_size]
+
+        drug_emb = self.drug_agg_proj(patient_drug_struct_agg.float())
+        # 用中心化门控，保证参数初始为 0 时残差也严格为 0。
+        gate = 2 * torch.sigmoid(self.drug_agg_gate) - 1
+        return gate * drug_emb
+
     def forward(self, x_dict, edge_index_dict, return_hidden=False):
         """异构图前向传播。"""
         patient_time = x_dict.pop("patient_time", None)
         drug_struct_feat = x_dict.pop("drug_struct_feat", None)
+        patient_drug_struct_agg = x_dict.pop("patient_drug_struct_agg", None)
 
         if "info_nodes" in x_dict:
             x_dict.pop("info_nodes")
@@ -235,6 +265,12 @@ class PreciseADR_RGCN(nn.Module):
             res.append(x_dict["patient"])
 
         hidden = x_dict["patient"]
+        patient_drug_residual = self._build_patient_drug_residual(
+            patient_drug_struct_agg=patient_drug_struct_agg,
+            batch_size=None,
+        )
+        if patient_drug_residual is not None:
+            hidden = hidden + patient_drug_residual
         x = self.readout(hidden)
         if return_hidden:
             return x, hidden
@@ -260,6 +296,7 @@ class PreciseADR_HGT(PreciseADR_RGCN):
         """HGT 前向传播。"""
         patient_time = x_dict.pop("patient_time", None)
         drug_struct_feat = x_dict.pop("drug_struct_feat", None)
+        patient_drug_struct_agg = x_dict.pop("patient_drug_struct_agg", None)
 
         if "info_nodes" in x_dict:
             x_dict.pop("info_nodes")
@@ -296,6 +333,12 @@ class PreciseADR_HGT(PreciseADR_RGCN):
             res.append(x_dict["patient"])
 
         hidden = x_dict["patient"]
+        patient_drug_residual = self._build_patient_drug_residual(
+            patient_drug_struct_agg=patient_drug_struct_agg,
+            batch_size=None,
+        )
+        if patient_drug_residual is not None:
+            hidden = hidden + patient_drug_residual
         x = self.readout(hidden)
 
         if return_hidden:
@@ -414,6 +457,8 @@ class BasicModelWrapper(LightningModule):
         # 注入时间和药物结构特征。
         if "time_days" in batch["patient"]:
             x_dict["patient_time"] = batch["patient"].time_days
+        if "drug_struct_agg" in batch["patient"]:
+            x_dict["patient_drug_struct_agg"] = batch["patient"].drug_struct_agg
         if "drug" in batch.node_types and "struct_feat" in batch["drug"]:
             x_dict["drug_struct_feat"] = batch["drug"].struct_feat
 
@@ -570,6 +615,8 @@ class BasicModelWrapper(LightningModule):
         batch["patient"].y = batch["patient"].y.to(device)
         if "time_days" in batch["patient"]:
             batch["patient"].time_days = batch["patient"].time_days.to(device)
+        if "drug_struct_agg" in batch["patient"]:
+            batch["patient"].drug_struct_agg = batch["patient"].drug_struct_agg.to(device)
 
         # edge_index_dict 不是标准张量字段，这里手动逐项迁移。
         edge_index_dict = {k: v.to(device) for k, v in batch.edge_index_dict.items()}

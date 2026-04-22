@@ -135,6 +135,9 @@ class PLEASESource(InMemoryDataset):
         # 药物共现图配置。默认开启，统计范围严格限定在当前数据集文件内部。
         self.use_drug_cooccur = bool(getattr(self.args, "use_drug_cooccur", True))
         self.drug_cooccur_min_count = int(getattr(self.args, "drug_cooccur_min_count", 10))
+        # patient 侧药物结构聚合配置。当前只支持 mean，保持实现简单。
+        self.use_patient_drug_agg = bool(getattr(self.args, "use_patient_drug_agg", True))
+        self.patient_drug_agg_type = str(getattr(self.args, "patient_drug_agg_type", "mean")).lower()
         # 时间特征开关（数据里始终会生成 time_days，模型侧按开关使用）。
         self.use_time_feature = bool(getattr(self.args, "use_time_feature", True))
 
@@ -208,9 +211,10 @@ class PLEASESource(InMemoryDataset):
         if self.drug_encoder_type.lower() == "molformer" and self.molformer_feat_path:
             molformer_tag = osp.splitext(osp.basename(self.molformer_feat_path))[0]
         return (
-            f'PLEASE_{self.se_type}_v4_{self.n_data}_'
+            f'PLEASE_{self.se_type}_v5_{self.n_data}_'
             f'{int(self.use_drug_struct)}_{self.drug_encoder_type}_{self.drug_struct_dim}_'
-            f'{molformer_tag}_{int(self.use_drug_cooccur)}_{self.drug_cooccur_min_count}.pt'
+            f'{molformer_tag}_{int(self.use_drug_cooccur)}_{self.drug_cooccur_min_count}_'
+            f'{int(self.use_patient_drug_agg)}_{self.patient_drug_agg_type}.pt'
         )
 
     @property
@@ -511,6 +515,9 @@ class PLEASESource(InMemoryDataset):
         self.hetero_graph["patient"].y = torch.cat(all_y, dim=0).to_sparse()
         self.hetero_graph["patient"].bow_feat = x.to_sparse()
 
+        # 直接把每个 patient 的用药结构做均值聚合，供 n_gnn=0 时走 patient 残差支路。
+        self._build_patient_drug_struct_agg(count)
+
         # 地区和时间保留下来，给按地区/时间切分的数据增强使用。
         self.hetero_graph["patient"].country = all_country
         self.hetero_graph["patient"].date = all_date
@@ -528,6 +535,41 @@ class PLEASESource(InMemoryDataset):
         self.hetero_graph["patient"].se_map = self.se_map
         self.hetero_graph["patient"].d_map = self.d_map
         self.hetero_graph["patient"].i_map = self.i_map
+
+    def _build_patient_drug_struct_agg(self, num_patient):
+        """按 patient-drug 边把药物结构向量聚合到 patient 侧。"""
+        if not self.use_patient_drug_agg:
+            print("[PatientDrugAgg] disabled")
+            return
+
+        if self.patient_drug_agg_type != "mean":
+            raise RuntimeError(f"当前只支持 mean 聚合，收到: {self.patient_drug_agg_type}")
+
+        if "struct_feat" not in self.hetero_graph["drug"]:
+            print("[PatientDrugAgg] skipped because drug.struct_feat is missing")
+            return
+
+        edge_index = self.hetero_graph["patient", "p_d", "drug"].edge_index
+        drug_struct_feat = self.hetero_graph["drug"].struct_feat
+        struct_dim = drug_struct_feat.size(1)
+
+        patient_drug_struct_agg = torch.zeros((num_patient, struct_dim), dtype=torch.float32)
+        if edge_index.numel() > 0:
+            patient_index = edge_index[0]
+            drug_index = edge_index[1]
+
+            # 先把同一 patient 的药物结构求和，再除以药物数得到均值。
+            patient_drug_struct_agg.index_add_(0, patient_index, drug_struct_feat[drug_index])
+            drug_count = torch.bincount(patient_index, minlength=num_patient).unsqueeze(1).float()
+            patient_drug_struct_agg = patient_drug_struct_agg / drug_count.clamp_min(1.0)
+
+        self.hetero_graph["patient"].drug_struct_agg = patient_drug_struct_agg
+        print(
+            "[PatientDrugAgg] type:",
+            self.patient_drug_agg_type,
+            "| shape:",
+            tuple(patient_drug_struct_agg.shape),
+        )
 
     def build_map(self, all_pd):
         """扫描全量数据，建立实体名称到连续 id 的映射。"""
@@ -852,7 +894,9 @@ class DataModule(LightningDataModule):
                 num_workers=num_workers,
                 persistent_workers=num_workers > 0#是否保持 worker 进程在 epoch 之间存活。
             )
-
+            #train_dataloader() 调一次，返回一个 NeighborLoader
+            #Lightning 在这个 NeighborLoader 上迭代出很多 batch
+            #不是每个 batch 都重新进一次 dataloader()
             # 手动保留 input_nodes，方便调试时直接查看。
             dataloader.input_nodes = ('patient', mask)
 
