@@ -36,8 +36,13 @@ use_drug_cooccur: false
 drug_cooccur_min_count: 10
 use_time_feature: false
 time_dim: 32
-use_label_gnn: true
+use_label_gnn: false
 label_gnn_topk: 20
 label_gnn_metric: jaccard
-use_patient_drug_agg: true
+use_patient_drug_agg: false
 patient_drug_agg_type: mean
+use_semantic_aug: true
+indication_drop_prob: 0.1
+drug_replace_prob: 0.1
+drug_knn_topk: 10
+hard_neg_topk: 1

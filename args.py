@@ -69,6 +69,12 @@ def register_args(parser, config_file="config/all_HGT_config.yaml"):
     # patient 侧药物结构聚合配置。
     parser.add_argument("--use_patient_drug_agg", type=bool, default=True)
     parser.add_argument("--patient_drug_agg_type", type=str, default="mean")
+    # S4 对比学习语义增强配置。
+    parser.add_argument("--use_semantic_aug", type=bool, default=True)
+    parser.add_argument("--indication_drop_prob", type=float, default=0.1)
+    parser.add_argument("--drug_replace_prob", type=float, default=0.1)
+    parser.add_argument("--drug_knn_topk", type=int, default=10)
+    parser.add_argument("--hard_neg_topk", type=int, default=1)
     parser.add_argument("--config", type=str, default=config_file)
 
 

@@ -2,6 +2,7 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.data import Batch
 from torch_geometric.nn import HeteroConv, HGTConv, SAGEConv, GATConv
@@ -62,6 +63,16 @@ class PreciseADR_RGCN(nn.Module):
         self.use_patient_drug_agg = bool(getattr(args, "use_patient_drug_agg", True)) and self.use_drug_struct
         self.patient_drug_agg_type = str(getattr(args, "patient_drug_agg_type", "mean")).lower()
         self.use_label_gnn = bool(getattr(args, "use_label_gnn", True))
+        # S4：语义增强和 batch 内 hard negative。关闭时回退旧版增强和 roll 负样本。
+        self.use_semantic_aug = bool(getattr(args, "use_semantic_aug", True))
+        self.indication_drop_prob = float(getattr(args, "indication_drop_prob", 0.1))
+        self.drug_replace_prob = float(getattr(args, "drug_replace_prob", 0.1))
+        self.drug_knn_topk = int(getattr(args, "drug_knn_topk", 10))
+        self.hard_neg_topk = int(getattr(args, "hard_neg_topk", 1))
+        self.i_start = int(getattr(args, "i_start", 0))
+        self.i_end = int(getattr(args, "i_end", 0))
+        self.d_start = int(getattr(args, "d_start", 0))
+        self.d_end = int(getattr(args, "d_end", 0))
 
         # in_lin 把统一 BOW 输入先映射到隐藏空间，供大多数节点类型共享。
         nn_layers = []
@@ -132,12 +143,22 @@ class PreciseADR_RGCN(nn.Module):
             self.drug_agg_proj = None
             self.drug_agg_gate = None
 
+        # 相似药近邻表由数据构建完成后注入，不写进 args。
+        self.register_buffer("drug_knn_index", torch.empty((0, 0), dtype=torch.long))
+
     def set_label_graph(self, label_adj: Tensor):
         """把训练集统计得到的标签邻接矩阵挂到模型里。"""
         if self.use_label_gnn:
             self.label_graph.set_label_adj(label_adj)
         else:
             self.label_graph.set_label_adj(None)
+
+    def set_drug_knn_index(self, drug_knn_index: Tensor):
+        """注入每个药物的相似药候选索引。"""
+        if drug_knn_index is None:
+            self.drug_knn_index = torch.empty((0, 0), dtype=torch.long)
+        else:
+            self.drug_knn_index = drug_knn_index.long().detach().clone()
 
     def _build_patient_drug_residual(self, patient_drug_struct_agg, batch_size):
         """把 patient 侧药物结构聚合向量变成隐藏空间残差。"""
@@ -155,16 +176,107 @@ class PreciseADR_RGCN(nn.Module):
         return gate * drug_emb
 
     def build_aug(self, x):
-        """在输入特征上随机补 1，生成对比学习使用的增强视图。"""
-        aug_x = torch.zeros_like(x)
+        """按 BOW 分段生成更合语义的对比学习增强视图。"""
+        if not self.use_semantic_aug:
+            # 旧版增强：全局随机补 1，保留开关方便做消融对比。
+            aug_x = torch.zeros_like(x)
+            aug_mask = torch.ones_like(x)
+            aug_mask = (self.aug_add(aug_mask) < 1)
+            aug_x[aug_mask] = 1
+            return x + aug_x
 
-        # 先构造全 1 掩码，再用 Dropout 产生随机保留位置。
-        aug_mask = torch.ones_like(x)
+        aug_x = x.clone()
+        batch_size = aug_x.size(0)
+        if batch_size == 0:
+            return aug_x
 
-        # Dropout 后小于 1 的位置表示该位置被置零，对应这里要人为补成 1 的增强位。
-        aug_mask = (self.aug_add(aug_mask) < 1)
-        aug_x[aug_mask] = 1
-        return x + aug_x
+        # 人口学段保持不动；这里只对 indication 段按样本级概率整段清零。
+        if self.i_end > self.i_start and self.indication_drop_prob > 0:
+            drop_mask = torch.rand(batch_size, device=aug_x.device) < self.indication_drop_prob
+            aug_x[drop_mask, self.i_start:self.i_end] = 0
+
+        # drug 段只做一个药物的相似药替换，避免增强视图偏离原病例太远。
+        if (
+            self.d_end > self.d_start
+            and self.drug_replace_prob > 0
+            and self.drug_knn_index.numel() > 0
+        ):
+            replace_mask = torch.rand(batch_size, device=aug_x.device) < self.drug_replace_prob
+            replace_rows = torch.nonzero(replace_mask, as_tuple=False).view(-1)
+            drug_slice = aug_x[:, self.d_start:self.d_end]
+
+            for row_idx in replace_rows.tolist():
+                active_drug_index = torch.nonzero(drug_slice[row_idx] > 0, as_tuple=False).view(-1)
+                if active_drug_index.numel() == 0:
+                    continue
+
+                src_pos = torch.randint(active_drug_index.numel(), (1,), device=aug_x.device).item()
+                src_drug = int(active_drug_index[src_pos].item())
+                if src_drug >= self.drug_knn_index.size(0):
+                    continue
+
+                current_drug_set = set(active_drug_index.tolist())
+                valid_neighbor = []
+                for neighbor_drug in self.drug_knn_index[src_drug].tolist():
+                    neighbor_drug = int(neighbor_drug)
+                    if neighbor_drug < 0:
+                        continue
+                    if neighbor_drug == src_drug:
+                        continue
+                    if neighbor_drug in current_drug_set:
+                        continue
+                    valid_neighbor.append(neighbor_drug)
+
+                if not valid_neighbor:
+                    continue
+
+                dst_pos = torch.randint(len(valid_neighbor), (1,), device=aug_x.device).item()
+                dst_drug = valid_neighbor[dst_pos]
+                aug_x[row_idx, self.d_start + src_drug] = 0
+                aug_x[row_idx, self.d_start + dst_drug] = 1
+
+        # SE 段保持不动，不给模型伪造标签输入。
+        return aug_x
+
+    def _select_hard_negative_indices(self, hid_aug, y):
+        """优先选择标签零重叠且表示最相似的 batch 内 hard negative。"""
+        batch_size = hid_aug.size(0)
+        if batch_size <= 1:
+            return torch.zeros(batch_size, dtype=torch.long, device=hid_aug.device)
+
+        # 负样本索引选择本身不参与反传，detach 可明显降低大 batch 下的显存占用。
+        norm_hid = F.normalize(hid_aug.detach(), dim=1)
+        y_float = y.detach().float()
+        all_index = torch.arange(batch_size, device=hid_aug.device)
+        hard_neg_index = torch.zeros(batch_size, dtype=torch.long, device=hid_aug.device)
+
+        # 分块计算，避免大 batch 下直接构造完整相似度矩阵导致显存峰值过高。
+        chunk_size = 1024
+        for start in range(0, batch_size, chunk_size):
+            end = min(start + chunk_size, batch_size)
+            query_index = torch.arange(start, end, device=hid_aug.device)
+            self_mask = all_index.unsqueeze(0) == query_index.unsqueeze(1)
+
+            sim_matrix = torch.matmul(norm_hid[start:end], norm_hid.t())
+            overlap_matrix = torch.matmul(y_float[start:end], y_float.t())
+            zero_overlap_mask = overlap_matrix <= 0
+            candidate_mask = (~self_mask) & zero_overlap_mask
+
+            masked_sim = sim_matrix.masked_fill(~candidate_mask, float("-inf"))
+            best_index = torch.argmax(masked_sim, dim=1)
+
+            # 如果一个样本没有零重叠候选，就退回到最相似的非自身样本。
+            no_valid_mask = ~candidate_mask.any(dim=1)
+            if no_valid_mask.any():
+                fallback_sim = sim_matrix[no_valid_mask].masked_fill(
+                    self_mask[no_valid_mask],
+                    float("-inf")
+                )
+                best_index[no_valid_mask] = torch.argmax(fallback_sim, dim=1)
+
+            hard_neg_index[start:end] = best_index
+
+        return hard_neg_index
 
     def _build_x_feat(self, x):
         """把输入 BOW 特征映射到隐藏空间。"""
@@ -391,14 +503,24 @@ class ContrastiveWrapper(BasicModelWrapper):
         y_hat, y = self.common_step(batch, return_hidden=True)
         y_hat, hid_pred, hid_assist, hid_aug = y_hat
 
-        # 通过滚动一个位置构造负样本，保持实现简单直接。
-        hid_neg = torch.roll(hid_aug, shifts=1)
-
         temperature = 0.1 if not hasattr(self.args, "temperature") else self.args.temperature
         info_loss_weight = 0.5 if not hasattr(self.args, "info_loss_weight") else self.args.info_loss_weight
 
-        # 对比学习部分只约束隐藏表示，不直接约束标签输出。
-        infonce_loss = info_nce(hid_pred, hid_aug, hid_neg, temperature=temperature)
+        if bool(getattr(self.model, "use_semantic_aug", False)):
+            # hard negative 只约束隐藏表示，不直接改监督分类目标。
+            hard_neg_index = self.model._select_hard_negative_indices(hid_aug, y)
+            hid_neg = hid_aug[hard_neg_index].unsqueeze(1)
+            infonce_loss = info_nce(
+                hid_pred,
+                hid_aug,
+                hid_neg,
+                temperature=temperature,
+                negative_mode="paired",
+            )
+        else:
+            # 旧版负样本：滚动一个位置，便于和 S4 做消融对照。
+            hid_neg = torch.roll(hid_aug, shifts=1)
+            infonce_loss = info_nce(hid_pred, hid_aug, hid_neg, temperature=temperature)
 
         # 总损失是监督损失与对比损失的加权和。
         loss = (1 - info_loss_weight) * self.loss_fn(y_hat, y) + info_loss_weight * infonce_loss

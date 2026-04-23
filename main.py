@@ -25,6 +25,34 @@ def setup_warning_filters():
 
 setup_warning_filters()
 
+
+def build_drug_knn_index(data, topk):
+    """基于药物结构向量预计算每个药物的相似药候选。"""
+    if topk <= 0 or "drug" not in data.node_types or "struct_feat" not in data["drug"]:
+        return None
+
+    struct_feat = data["drug"].struct_feat.float()
+    num_drug = struct_feat.size(0)
+    if num_drug <= 1:
+        return torch.empty((num_drug, 0), dtype=torch.long)
+
+    keep_topk = min(int(topk), num_drug - 1)
+    # cosine 相似度：先单位化，再做矩阵乘法。
+    norm_feat = torch.nn.functional.normalize(struct_feat, dim=1)
+    sim_matrix = torch.matmul(norm_feat, norm_feat.t())
+    sim_matrix.fill_diagonal_(float("-inf"))
+    drug_knn_index = torch.topk(sim_matrix, k=keep_topk, dim=1).indices.long()
+    print(
+        "[DrugKNN] topk:",
+        keep_topk,
+        "| num_drug:",
+        num_drug,
+        "| shape:",
+        tuple(drug_knn_index.shape),
+    )
+    return drug_knn_index
+
+
 def build_dataset_func(args):
     """根据参数构建数据模块，并把图结构相关维度回填到 `args`。"""
     if args.dataset in ["gender", "age", "all"]:
@@ -81,6 +109,12 @@ def build_dataset_func(args):
     else:
         args.drug_struct_dim = 0
 
+    # S4 语义增强需要相似药候选表，直接从当前数据集的 drug.struct_feat 预计算。
+    if bool(getattr(args, "use_semantic_aug", True)):
+        datamodule.drug_knn_index = build_drug_knn_index(data, int(getattr(args, "drug_knn_topk", 10)))
+    else:
+        datamodule.drug_knn_index = None
+
     # 打印划分结果，便于确认当前 split 是否符合预期。
     print("train data size:", datamodule.data["patient"].train_mask.sum())
     print("val data size:", datamodule.data["patient"].val_mask.sum())
@@ -113,6 +147,9 @@ def main(args, other_callbacks=[], dataset_func=build_dataset_func, model_wrappe
     # 标签关系图在数据切分完成后生成，这里再显式注入到模型。
     if hasattr(datamodule, "label_adj") and hasattr(model, "model") and hasattr(model.model, "set_label_graph"):
         model.model.set_label_graph(datamodule.label_adj)
+    # 相似药候选表同样在数据构建后注入模型，只服务于训练时的语义增强。
+    if hasattr(datamodule, "drug_knn_index") and hasattr(model, "model") and hasattr(model.model, "set_drug_knn_index"):
+        model.model.set_drug_knn_index(datamodule.drug_knn_index)
     # 统一按 args.device 判定训练设备，避免 main_eval 漏传参数时走错设备。
     accelerator = "gpu" if ("cuda" in str(args.device).lower() and torch.cuda.is_available()) else "cpu"
     devices = 1
@@ -234,6 +271,8 @@ def main_predict(args, dataset_func=build_dataset_func, model_wrapper=BasicModel
 
     # 这里直接从 checkpoint 反序列化 LightningModule。
     model = model_wrapper.load_from_checkpoint(checkpoint_path=ckpt_path)
+    if hasattr(datamodule, "drug_knn_index") and hasattr(model, "model") and hasattr(model.model, "set_drug_knn_index"):
+        model.model.set_drug_knn_index(datamodule.drug_knn_index)
 
     trainer = Trainer(
         accelerator='gpu' if "cuda" in args.device else "cpu",
